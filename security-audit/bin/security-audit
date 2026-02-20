@@ -262,14 +262,10 @@ cmd_setup() {
 
   # Static analysis
   printf '%b\n' "${BOLD}Static analysis:${RESET}"
-  if has opengrep; then
-    log_ok "opengrep (LGPL 2.1, semgrep-compatible)"
-  elif has semgrep; then
-    log_ok "semgrep (note: restrictive license since Dec 2024)"
-  else
-    install_with_fallback "opengrep" "opengrep" \
-      "curl:curl -fsSL https://raw.githubusercontent.com/opengrep/opengrep/main/install.sh | bash"
-  fi
+  install_with_fallback "semgrep" "semgrep" \
+    "uv:uv tool install semgrep" \
+    "pip:pip install --user semgrep" \
+    "brew:brew install semgrep"
 
   install_with_fallback "bandit" "bandit" \
     "uv:uv tool install bandit" \
@@ -400,7 +396,7 @@ build_tool_plan() {
 
   # Static analysis & IaC (standard + deep only)
   if [[ "$PROFILE" != "quick" ]]; then
-    (has opengrep || has semgrep) && tools+=(sast)
+    has semgrep && tools+=(sast)
     [[ -n "$LANG_PYTHON" ]]     && tools+=(bandit)
     [[ -n "$LANG_SHELL" ]]      && tools+=(shellcheck)
     [[ -n "$LANG_DOCKER" ]]     && tools+=(hadolint)
@@ -451,7 +447,7 @@ check_tool_availability() {
       govulncheck)   cmd="govulncheck" ;;
       cargo-audit)   cmd="cargo-audit" ;;
       bundler-audit) cmd="bundler-audit" ;;
-      sast)          cmd="$(command -v opengrep 2>/dev/null || command -v semgrep 2>/dev/null || echo "")" ;;
+      sast)          cmd="semgrep" ;;
       bandit)        cmd="bandit" ;;
       shellcheck)    cmd="shellcheck" ;;
       hadolint)      cmd="hadolint" ;;
@@ -524,9 +520,7 @@ tool_command() {
     bundler-audit)
       echo "bundler-audit check --format json 2>/dev/null" ;;
     sast)
-      local sast_cmd
-      sast_cmd="$(command -v opengrep 2>/dev/null || command -v semgrep 2>/dev/null)"
-      echo "$sast_cmd scan --config=auto --json --quiet . 2>/dev/null" ;;
+      echo "semgrep scan --config=auto --json --quiet . 2>/dev/null" ;;
     bandit)
       echo "bandit -r . -f json --severity-level medium 2>/dev/null" ;;
     shellcheck)

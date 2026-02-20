@@ -55,8 +55,8 @@ jobs:
       - name: Install Python tools
         run: pip install bandit
 
-      - name: Install opengrep
-        run: curl -fsSL https://raw.githubusercontent.com/opengrep/opengrep/main/install.sh | bash
+      - name: Install semgrep
+        run: pip install semgrep
 
       - name: Set up Node (if needed)
         if: hashFiles('package.json') != ''

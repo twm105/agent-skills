@@ -17,17 +17,7 @@ Run tools only when their language indicators are present:
 | `go.mod` | govulncheck |
 | `Cargo.toml`, `Cargo.lock` | cargo audit |
 | `Gemfile`, `Gemfile.lock` | bundler-audit |
-| _(always)_ | gitleaks, semgrep/opengrep |
-
-## Semgrep / Opengrep Auto-Detection
-
-These tools share identical CLI syntax. Auto-detect which is available:
-
-```bash
-SAST_CMD="$(command -v opengrep 2>/dev/null || command -v semgrep 2>/dev/null || echo "")"
-```
-
-Opengrep is a community fork (LGPL 2.1) with better cross-function taint analysis performance. Either works identically for this skill's purposes. See section 12 for licensing details. All invocations below use `$SAST_CMD` as placeholder.
+| _(always)_ | gitleaks, semgrep |
 
 ---
 
@@ -383,40 +373,25 @@ hadolint --format json Dockerfile* **/Dockerfile* 2>/dev/null
 
 ---
 
-## 12. semgrep / opengrep — Multi-Language SAST
+## 12. semgrep — Multi-Language SAST
 
 **What it checks**: Language-aware static analysis with pattern matching. Covers OWASP Top 10, injection, crypto, auth issues.
 
-> **License note**: In December 2024, Semgrep Inc. changed its licensing —
-> community rules moved to the restrictive "Semgrep Rules License" and key
-> features (fingerprinting, meta-variables in some contexts) were paywalled.
-> [Opengrep](https://opengrep.dev) is a community fork (LGPL 2.1) backed by
-> 10+ security companies (Aikido, Endor Labs, Orca, etc.) that restores full
-> open-source access. The CLI syntax is identical.
->
-> **Recommendation**: Use opengrep for open-source projects. Semgrep remains
-> viable if you have a commercial license or only use the free tier.
-
-**Auto-detect**:
-```bash
-SAST_CMD="$(command -v opengrep 2>/dev/null || command -v semgrep 2>/dev/null || echo "")"
-if [[ -z "$SAST_CMD" ]]; then
-  echo "Neither opengrep nor semgrep found. Skipping SAST."
-fi
-```
+> **Warning**: Do **not** use the "opengrep" fork — it was subject to a supply
+> chain compromise. Use the official semgrep package only.
 
 **Invocation**:
 ```bash
-$SAST_CMD scan --config=auto --json --quiet . 2>/dev/null
+semgrep scan --config=auto --json --quiet . 2>/dev/null
 ```
 
 **For specific rulesets**:
 ```bash
 # Security-focused only
-$SAST_CMD scan --config=p/security-audit --json --quiet . 2>/dev/null
+semgrep scan --config=p/security-audit --json --quiet . 2>/dev/null
 
 # OWASP Top 10
-$SAST_CMD scan --config=p/owasp-top-ten --json --quiet . 2>/dev/null
+semgrep scan --config=p/owasp-top-ten --json --quiet . 2>/dev/null
 ```
 
 **Parse fields**:
@@ -437,9 +412,7 @@ $SAST_CMD scan --config=p/owasp-top-ten --json --quiet . 2>/dev/null
 | INFO | **Low** |
 
 **Notes**:
-- Opengrep performs better on cross-function taint analysis benchmarks
-- Both use identical rule format and CLI interface
-- `--config=auto` fetches community rulesets (requires network). With semgrep, these are now under the restrictive Semgrep Rules License; with opengrep, they are fully open.
+- `--config=auto` fetches community rulesets (requires network)
 
 **Exit codes**: 0 = clean, 1 = findings.
 

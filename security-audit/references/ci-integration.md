@@ -124,9 +124,9 @@ For CI, you may prefer running tools directly rather than through the full CLI:
 - name: npm audit
   run: npm audit --json > npm-audit.json || true
 
-# Static analysis (opengrep — LGPL 2.1 fork of semgrep, identical CLI)
-- name: Opengrep
-  run: opengrep scan --config=auto --json --quiet . > opengrep.json
+# Static analysis
+- name: Semgrep
+  run: semgrep scan --config=auto --json --quiet . > semgrep.json
 ```
 
 ### SARIF Upload
@@ -159,11 +159,11 @@ Speed up repeated runs by caching tool databases:
     path: ~/.cache/trivy
     key: trivy-db-${{ runner.os }}
 
-- name: Cache opengrep rules
+- name: Cache semgrep rules
   uses: actions/cache@v4
   with:
     path: ~/.cache/semgrep
-    key: opengrep-rules-${{ hashFiles('.semgrep.yml') }}
+    key: semgrep-rules-${{ hashFiles('.semgrep.yml') }}
 ```
 
 ## GitLab CI
@@ -174,7 +174,7 @@ security-audit:
   image: python:3.12
   before_script:
     - pip install bandit
-    - curl -fsSL https://raw.githubusercontent.com/opengrep/opengrep/main/install.sh | bash
+    - pip install semgrep
     - apt-get update && apt-get install -y shellcheck
     - curl -sSfL https://github.com/gitleaks/gitleaks/releases/latest/download/gitleaks_linux_amd64 -o /usr/local/bin/gitleaks && chmod +x /usr/local/bin/gitleaks
     - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
