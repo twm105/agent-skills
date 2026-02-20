@@ -93,6 +93,17 @@ Combine CLI findings and agent review into a single summary for the user:
 | Medium | Potential issue: moderate confidence, limited impact |
 | Low | Best practice: informational, style, minor hardening |
 
+## CI / GitHub Actions
+
+The `security-audit` CLI is **not installed globally** on CI runners. When setting up a GitHub Actions workflow or any CI security check, you **must** copy the latest version of `bin/security-audit` from this skill into the target repository (e.g. as `.github/scripts/security-audit`). The workflow should then run it from that path.
+
+```yaml
+- name: Security audit
+  run: .github/scripts/security-audit -p quick -q --sarif > results.sarif
+```
+
+Use `assets/github-action.example.yml` as the starting template. See `references/ci-integration.md` for SARIF upload (private to repo writers), caching, and threshold configuration.
+
 ## Reference Files
 
 - `references/tool-catalog.md` — per-tool invocation, parsing, severity mapping
