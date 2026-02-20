@@ -1,0 +1,1468 @@
+#!/usr/bin/env bash
+# security-audit — CLI for repository security analysis
+# Usage: security-audit [scan] [OPTIONS]
+#        security-audit setup [--check-only]
+#        security-audit report [--latest|--list] [--stdout]
+#        security-audit version
+#
+# Compatible with bash 3.2+ (macOS default) — no associative arrays.
+set -euo pipefail
+
+readonly VERSION="1.0.0"
+readonly DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/security-audit"
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+
+if [[ -t 1 ]]; then
+  RED='\033[0;31m' GREEN='\033[0;32m' YELLOW='\033[0;33m' BLUE='\033[0;34m'
+  BOLD='\033[1m' DIM='\033[2m' RESET='\033[0m'
+else
+  RED='' GREEN='' YELLOW='' BLUE='' BOLD='' DIM='' RESET=''
+fi
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+VERBOSE=false
+QUIET=false
+
+log()      { $QUIET || printf '%s\n' "$*"; }
+log_info() { $QUIET || printf '%b\n' "${BLUE}ℹ${RESET} $*"; }
+log_ok()   { $QUIET || printf '%b\n' "${GREEN}✓${RESET} $*"; }
+log_warn() { $QUIET || printf '%b\n' "${YELLOW}⚠${RESET} $*" >&2; }
+log_err()  { printf '%b\n' "${RED}✗${RESET} $*" >&2; }
+log_verb() { $VERBOSE && printf '%b\n' "${DIM}  → $*${RESET}" >&2 || true; }
+
+die() { log_err "$@"; exit 1; }
+
+# ── Repo detection ────────────────────────────────────────────────────────────
+
+detect_repo() {
+  REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) \
+    || die "Not inside a git repository"
+  REPO_NAME=$(basename "$REPO_ROOT")
+  REPO_BRANCH=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+  REPO_DIR="$DATA_DIR/$REPO_NAME"
+}
+
+# ── Timeout command (macOS vs Linux) ──────────────────────────────────────────
+
+detect_timeout_cmd() {
+  if command -v gtimeout &>/dev/null; then
+    TIMEOUT_CMD="gtimeout"
+  elif command -v timeout &>/dev/null; then
+    TIMEOUT_CMD="timeout"
+  else
+    TIMEOUT_CMD=""
+    log_warn "Neither gtimeout nor timeout found — tools will run without timeouts"
+  fi
+}
+
+# ── Help ──────────────────────────────────────────────────────────────────────
+
+print_help() {
+  cat <<'HELP'
+security-audit — Repository security analysis CLI
+
+USAGE
+  security-audit [scan] [OPTIONS]       Run a security scan (default)
+  security-audit setup [--check-only]   Install/check required tools
+  security-audit report [OPTIONS]       View stored reports
+  security-audit version                Show version
+
+SCAN OPTIONS
+  -p, --profile <quick|standard|deep>   Scan profile (default: standard)
+  -t, --tool <name>                     Run only this tool (repeatable)
+      --stdout                          Print full markdown report to stdout
+      --json                            Print unified findings JSON to stdout
+      --no-parallel                     Run tools sequentially
+  -v, --verbose                         Show tool commands and raw output
+  -q, --quiet                           Suppress progress, just exit code
+
+REPORT OPTIONS
+      --latest                          Show most recent report (default)
+      --list                            List all stored reports
+      --stdout                          Print report to stdout
+
+PROFILES
+  quick       Secrets + dependency scan (~1 min)
+  standard    + static analysis, container/IaC scanning (~5 min)
+  deep        + full git history, all tools (~15 min)
+
+EXIT CODES
+  0   Clean — no findings at Medium or above
+  1   Findings — at least one Medium+ finding
+  2   Tool error — one or more tools failed/timed out
+
+STORAGE
+  Reports stored in: ~/.local/share/security-audit/<repo>/
+HELP
+}
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+
+SUBCMD="scan"
+PROFILE="standard"
+TOOL_FILTER=()
+OPT_STDOUT=false
+OPT_JSON=false
+OPT_PARALLEL=true
+# report subcommand
+RPT_LIST=false
+# setup subcommand
+SETUP_CHECK_ONLY=false
+
+parse_args() {
+  # Detect subcommand
+  case "${1:-}" in
+    setup|report|version|help|--help|-h)
+      SUBCMD="${1}"; shift
+      [[ "$SUBCMD" == "--help" || "$SUBCMD" == "-h" || "$SUBCMD" == "help" ]] && SUBCMD="help"
+      ;;
+    scan) SUBCMD="scan"; shift ;;
+  esac
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -p|--profile)
+        [[ -n "${2:-}" ]] || die "Missing value for $1"
+        PROFILE="$2"
+        [[ "$PROFILE" =~ ^(quick|standard|deep)$ ]] || die "Invalid profile: $PROFILE"
+        shift 2 ;;
+      -t|--tool)
+        [[ -n "${2:-}" ]] || die "Missing value for $1"
+        TOOL_FILTER+=("$2"); shift 2 ;;
+      --stdout)      OPT_STDOUT=true; shift ;;
+      --json)        OPT_JSON=true; shift ;;
+      --no-parallel) OPT_PARALLEL=false; shift ;;
+      -v|--verbose)  VERBOSE=true; shift ;;
+      -q|--quiet)    QUIET=true; shift ;;
+      --check-only)  SETUP_CHECK_ONLY=true; shift ;;
+      --list)        RPT_LIST=true; shift ;;
+      --latest)      RPT_LIST=false; shift ;;
+      -h|--help)     SUBCMD="help"; shift ;;
+      -*) die "Unknown option: $1" ;;
+      *)  die "Unexpected argument: $1" ;;
+    esac
+  done
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SETUP SUBCOMMAND
+# ══════════════════════════════════════════════════════════════════════════════
+
+setup_installed=()
+setup_skipped=()
+setup_failed=()
+setup_missing=()
+
+has() { command -v "$1" &>/dev/null; }
+
+install_with_fallback() {
+  local name="$1" check_cmd="$2"; shift 2
+
+  if has "$check_cmd"; then
+    if $SETUP_CHECK_ONLY; then
+      log_ok "$name (installed)"
+    else
+      setup_skipped+=("$name")
+      log_ok "$name (already installed)"
+    fi
+    return
+  fi
+
+  if $SETUP_CHECK_ONLY; then
+    setup_missing+=("$name")
+    printf '%b\n' "  ${RED}✗${RESET} $name (not installed)"
+    return
+  fi
+
+  for strategy in "$@"; do
+    local method="${strategy%%:*}"
+    local cmd="${strategy#*:}"
+    # Skip strategy if its package manager isn't available
+    has "$method" || continue
+    if eval "$cmd" &>/dev/null; then
+      setup_installed+=("$name")
+      log_ok "$name installed (via $method)"
+      return
+    fi
+  done
+
+  setup_failed+=("$name")
+  log_err "$name — no install method available"
+}
+
+cmd_setup() {
+  printf '%b\n\n' "${BOLD}Security Audit — Tool Setup${RESET}"
+
+  printf '%b\n' "${BOLD}Package managers:${RESET}"
+  for mgr in brew uv pip npm cargo go gem curl; do
+    if has "$mgr"; then
+      log_ok "$mgr"
+    else
+      printf '%b\n' "  ${YELLOW}–${RESET} $mgr (not found)"
+    fi
+  done
+  echo ""
+
+  # Required: jq
+  printf '%b\n' "${BOLD}Required dependencies:${RESET}"
+  install_with_fallback "jq" "jq" \
+    "brew:brew install jq" \
+    "curl:curl -sSfL https://github.com/jqlang/jq/releases/latest/download/jq-linux-amd64 -o /usr/local/bin/jq && chmod +x /usr/local/bin/jq"
+
+  # macOS: coreutils for gtimeout
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    install_with_fallback "coreutils" "gtimeout" \
+      "brew:brew install coreutils"
+  fi
+  echo ""
+
+  # Secrets
+  printf '%b\n' "${BOLD}Secrets detection:${RESET}"
+  install_with_fallback "gitleaks" "gitleaks" \
+    "brew:brew install gitleaks" \
+    "go:go install github.com/gitleaks/gitleaks/v8@latest" \
+    "curl:curl -sSfL https://github.com/gitleaks/gitleaks/releases/latest/download/gitleaks_\$(uname -s | tr '[:upper:]' '[:lower:]')_\$(uname -m | sed 's/x86_64/x64/').tar.gz | tar xz -C /usr/local/bin gitleaks"
+  echo ""
+
+  # Dependencies
+  printf '%b\n' "${BOLD}Dependency scanners:${RESET}"
+
+  if python3 -c "import sys; exit(0 if sys.version_info < (3, 14) else 1)" 2>/dev/null; then
+    install_with_fallback "pip-audit" "pip-audit" \
+      "uv:uv tool install pip-audit" \
+      "pip:pip install --user pip-audit"
+  else
+    printf '%b\n' "  ${YELLOW}–${RESET} pip-audit (skipped — requires Python ≤3.13, trivy covers Python deps)"
+  fi
+
+  install_with_fallback "trivy" "trivy" \
+    "brew:brew install trivy" \
+    "curl:curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin"
+
+  install_with_fallback "cargo-audit" "cargo-audit" \
+    "cargo:cargo install cargo-audit"
+
+  install_with_fallback "govulncheck" "govulncheck" \
+    "go:go install golang.org/x/vuln/cmd/govulncheck@latest"
+
+  install_with_fallback "bundler-audit" "bundler-audit" \
+    "gem:gem install bundler-audit"
+
+  if has npm; then
+    log_ok "npm audit (built into npm)"
+  else
+    printf '%b\n' "  ${YELLOW}–${RESET} npm audit (requires npm)"
+  fi
+  echo ""
+
+  # Static analysis
+  printf '%b\n' "${BOLD}Static analysis:${RESET}"
+  if has opengrep; then
+    log_ok "opengrep (LGPL 2.1, semgrep-compatible)"
+  elif has semgrep; then
+    log_ok "semgrep (note: restrictive license since Dec 2024)"
+  else
+    install_with_fallback "opengrep" "opengrep" \
+      "curl:curl -fsSL https://raw.githubusercontent.com/opengrep/opengrep/main/install.sh | bash"
+  fi
+
+  install_with_fallback "bandit" "bandit" \
+    "uv:uv tool install bandit" \
+    "pip:pip install --user bandit"
+
+  install_with_fallback "shellcheck" "shellcheck" \
+    "brew:brew install shellcheck" \
+    "curl:curl -sSfL https://github.com/koalaman/shellcheck/releases/latest/download/shellcheck-stable.linux.x86_64.tar.xz | tar xJ --strip-components=1 -C /usr/local/bin shellcheck-stable/shellcheck"
+  echo ""
+
+  # Container / IaC
+  printf '%b\n' "${BOLD}Container & IaC:${RESET}"
+  install_with_fallback "hadolint" "hadolint" \
+    "brew:brew install hadolint" \
+    "curl:curl -sSfL https://github.com/hadolint/hadolint/releases/latest/download/hadolint-\$(uname -s)-\$(uname -m) -o /usr/local/bin/hadolint && chmod +x /usr/local/bin/hadolint"
+
+  install_with_fallback "checkov" "checkov" \
+    "uv:uv tool install checkov" \
+    "pip:pip install --user checkov"
+  echo ""
+
+  # Summary
+  printf '%b\n' "${BOLD}Summary:${RESET}"
+  if $SETUP_CHECK_ONLY; then
+    local n_missing=${#setup_missing[@]}
+    if [[ $n_missing -eq 0 ]]; then
+      printf '%b\n' "  ${GREEN}All tools are installed.${RESET}"
+    else
+      printf '%b\n' "  ${RED}${n_missing} tool(s) missing:${RESET} ${setup_missing[*]}"
+      log "  Run 'security-audit setup' to install them."
+    fi
+  else
+    [[ ${#setup_installed[@]} -gt 0 ]] && printf '%b\n' "  ${GREEN}Installed:${RESET} ${setup_installed[*]}"
+    [[ ${#setup_skipped[@]} -gt 0 ]]   && printf '%b\n' "  ${YELLOW}Already present:${RESET} ${setup_skipped[*]}"
+    [[ ${#setup_failed[@]} -gt 0 ]]    && printf '%b\n' "  ${RED}Failed:${RESET} ${setup_failed[*]}"
+    if [[ ${#setup_failed[@]} -eq 0 ]]; then
+      printf '%b\n' "  ${GREEN}All tools ready.${RESET}"
+    else
+      log_warn "Some tools failed to install. Run them manually or check your PATH."
+      exit 1
+    fi
+  fi
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  LANGUAGE DETECTION & TOOL PLANNING
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Language flags (bash 3.2 compatible — no associative arrays)
+LANG_PYTHON="" LANG_PYTHON_VENV="" LANG_NODE="" LANG_SHELL=""
+LANG_DOCKER="" LANG_TERRAFORM="" LANG_GO="" LANG_RUST="" LANG_RUBY=""
+DETECTED_LANGS=""
+
+detect_languages() {
+  cd "$REPO_ROOT"
+
+  # Python — use find instead of compgen **/ (which needs globstar)
+  if compgen -G "*.py" >/dev/null 2>&1 || [[ -n "$(find . -name '*.py' -maxdepth 3 -print -quit 2>/dev/null)" ]]; then
+    LANG_PYTHON=1
+    if [[ -n "${VIRTUAL_ENV:-}" ]] || [[ -d ".venv" ]] || [[ -d "venv" ]]; then
+      LANG_PYTHON_VENV=1
+    fi
+  fi
+
+  # Node.js
+  if [[ -f "package.json" ]] || compgen -G "*.js" >/dev/null 2>&1 || compgen -G "*.ts" >/dev/null 2>&1; then
+    LANG_NODE=1
+  fi
+
+  # Shell
+  if compgen -G "*.sh" >/dev/null 2>&1 || [[ -n "$(find . -name '*.sh' -maxdepth 3 -print -quit 2>/dev/null)" ]] \
+     || compgen -G "*.bash" >/dev/null 2>&1 || compgen -G "*.zsh" >/dev/null 2>&1; then
+    LANG_SHELL=1
+  fi
+
+  # Docker
+  if compgen -G "Dockerfile*" >/dev/null 2>&1 || compgen -G "docker-compose*.yml" >/dev/null 2>&1; then
+    LANG_DOCKER=1
+  fi
+
+  # Terraform / IaC
+  if compgen -G "*.tf" >/dev/null 2>&1 || compgen -G "*.tfvars" >/dev/null 2>&1; then
+    LANG_TERRAFORM=1
+  fi
+
+  # Go
+  [[ -f "go.mod" ]] && LANG_GO=1
+
+  # Rust
+  [[ -f "Cargo.toml" || -f "Cargo.lock" ]] && LANG_RUST=1
+
+  # Ruby
+  [[ -f "Gemfile" || -f "Gemfile.lock" ]] && LANG_RUBY=1
+
+  # Build human-readable list
+  DETECTED_LANGS=""
+  [[ -n "$LANG_PYTHON" ]] && DETECTED_LANGS="python "
+  [[ -n "$LANG_PYTHON_VENV" ]] && DETECTED_LANGS="${DETECTED_LANGS}python_venv "
+  [[ -n "$LANG_NODE" ]] && DETECTED_LANGS="${DETECTED_LANGS}node "
+  [[ -n "$LANG_SHELL" ]] && DETECTED_LANGS="${DETECTED_LANGS}shell "
+  [[ -n "$LANG_DOCKER" ]] && DETECTED_LANGS="${DETECTED_LANGS}docker "
+  [[ -n "$LANG_TERRAFORM" ]] && DETECTED_LANGS="${DETECTED_LANGS}terraform "
+  [[ -n "$LANG_GO" ]] && DETECTED_LANGS="${DETECTED_LANGS}go "
+  [[ -n "$LANG_RUST" ]] && DETECTED_LANGS="${DETECTED_LANGS}rust "
+  [[ -n "$LANG_RUBY" ]] && DETECTED_LANGS="${DETECTED_LANGS}ruby "
+  DETECTED_LANGS="${DETECTED_LANGS% }"  # trim trailing space
+
+  log_verb "Languages detected: $DETECTED_LANGS"
+}
+
+# TOOL_PLAN is a space-separated list of tool names to run
+TOOL_PLAN=""
+
+build_tool_plan() {
+  local tools=()
+
+  # Always run gitleaks
+  tools+=(gitleaks)
+
+  # Dependency scanners
+  [[ -n "$LANG_PYTHON_VENV" ]] && tools+=(pip-audit)
+  [[ -n "$LANG_PYTHON" ]]      && tools+=(trivy)
+  [[ -n "$LANG_NODE" ]] && has npm && tools+=(npm-audit)
+  [[ -n "$LANG_GO" ]]          && tools+=(govulncheck)
+  [[ -n "$LANG_RUST" ]]        && tools+=(cargo-audit)
+  [[ -n "$LANG_RUBY" ]]        && tools+=(bundler-audit)
+  [[ -n "$LANG_DOCKER" ]]      && tools+=(trivy)
+
+  # Static analysis & IaC (standard + deep only)
+  if [[ "$PROFILE" != "quick" ]]; then
+    (has opengrep || has semgrep) && tools+=(sast)
+    [[ -n "$LANG_PYTHON" ]]     && tools+=(bandit)
+    [[ -n "$LANG_SHELL" ]]      && tools+=(shellcheck)
+    [[ -n "$LANG_DOCKER" ]]     && tools+=(hadolint)
+    [[ -n "$LANG_TERRAFORM" ]]  && tools+=(checkov)
+  fi
+
+  # Deduplicate (bash 3.2 compatible — linear scan)
+  local deduped=()
+  for t in "${tools[@]}"; do
+    local dup=false
+    for d in "${deduped[@]+"${deduped[@]}"}"; do
+      [[ "$t" == "$d" ]] && { dup=true; break; }
+    done
+    $dup || deduped+=("$t")
+  done
+
+  # Apply --tool filter if set
+  if [[ ${#TOOL_FILTER[@]} -gt 0 ]]; then
+    local filtered=()
+    for t in "${deduped[@]}"; do
+      for f in "${TOOL_FILTER[@]}"; do
+        [[ "$t" == "$f" ]] && { filtered+=("$t"); break; }
+      done
+    done
+    deduped=("${filtered[@]+"${filtered[@]}"}")
+  fi
+
+  TOOL_PLAN="${deduped[*]}"
+  log_verb "Tool plan: $TOOL_PLAN"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TOOL AVAILABILITY
+# ══════════════════════════════════════════════════════════════════════════════
+
+TOOLS_RUN=()
+TOOLS_SKIPPED=()
+
+check_tool_availability() {
+  local available=()
+  for tool in $TOOL_PLAN; do
+    local cmd=""
+    case "$tool" in
+      gitleaks)      cmd="gitleaks" ;;
+      pip-audit)     cmd="pip-audit" ;;
+      npm-audit)     cmd="npm" ;;
+      trivy)         cmd="trivy" ;;
+      govulncheck)   cmd="govulncheck" ;;
+      cargo-audit)   cmd="cargo-audit" ;;
+      bundler-audit) cmd="bundler-audit" ;;
+      sast)          cmd="$(command -v opengrep 2>/dev/null || command -v semgrep 2>/dev/null || echo "")" ;;
+      bandit)        cmd="bandit" ;;
+      shellcheck)    cmd="shellcheck" ;;
+      hadolint)      cmd="hadolint" ;;
+      checkov)       cmd="checkov" ;;
+    esac
+
+    if [[ -n "$cmd" ]] && has "${cmd##*/}"; then
+      available+=("$tool")
+    else
+      TOOLS_SKIPPED+=("$tool")
+      log_warn "$tool not found — skipping. Run 'security-audit setup' to install."
+    fi
+  done
+
+  TOOL_PLAN="${available[*]}"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TOOL EXECUTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+SCAN_DIR=""
+SCAN_START=0
+TOOL_ERRORS=0
+
+init_scan_dir() {
+  local ts
+  ts=$(date +"%Y-%m-%d_%H%M%S")
+  SCAN_DIR="$REPO_DIR/scans/$ts"
+  mkdir -p "$SCAN_DIR/raw"
+  SCAN_START=$(date +%s)
+  log_verb "Scan directory: $SCAN_DIR"
+}
+
+# Get timeout seconds for a tool
+tool_timeout() {
+  case "$1" in
+    gitleaks)
+      if [[ "$PROFILE" == "deep" ]]; then echo 300; else echo 60; fi ;;
+    pip-audit|npm-audit|govulncheck|bandit) echo 120 ;;
+    trivy|sast|checkov) echo 180 ;;
+    cargo-audit|bundler-audit) echo 60 ;;
+    shellcheck|hadolint) echo 30 ;;
+    *) echo 120 ;;
+  esac
+}
+
+# Build the command for a single tool
+tool_command() {
+  local tool="$1"
+  cd "$REPO_ROOT"
+
+  case "$tool" in
+    gitleaks)
+      if [[ "$PROFILE" == "deep" ]]; then
+        echo "gitleaks detect --source . --no-banner --report-format json --report-path /dev/stdout 2>/dev/null"
+      else
+        echo "gitleaks detect --source . --no-banner --report-format json --report-path /dev/stdout --log-opts='HEAD~20..HEAD' 2>/dev/null"
+      fi ;;
+    pip-audit)
+      echo "pip-audit --format=json --desc 2>/dev/null" ;;
+    npm-audit)
+      echo "npm audit --json 2>/dev/null" ;;
+    trivy)
+      echo "trivy fs --format json --severity HIGH,CRITICAL --quiet . 2>/dev/null" ;;
+    govulncheck)
+      echo "govulncheck -json ./... 2>/dev/null" ;;
+    cargo-audit)
+      echo "cargo audit --json 2>/dev/null" ;;
+    bundler-audit)
+      echo "bundler-audit check --format json 2>/dev/null" ;;
+    sast)
+      local sast_cmd
+      sast_cmd="$(command -v opengrep 2>/dev/null || command -v semgrep 2>/dev/null)"
+      echo "$sast_cmd scan --config=auto --json --quiet . 2>/dev/null" ;;
+    bandit)
+      echo "bandit -r . -f json --severity-level medium 2>/dev/null" ;;
+    shellcheck)
+      # Find shell files and pass to shellcheck
+      echo "find . -name '*.sh' -o -name '*.bash' -o -name '*.zsh' | xargs shellcheck -f json --severity=warning 2>/dev/null" ;;
+    hadolint)
+      echo "find . -name 'Dockerfile*' | xargs hadolint --format json 2>/dev/null" ;;
+    checkov)
+      echo "checkov -d . --output json --quiet --compact 2>/dev/null" ;;
+  esac
+}
+
+# Run a single tool, capturing output to raw/ dir
+run_single_tool() {
+  local tool="$1"
+  local timeout_s
+  timeout_s=$(tool_timeout "$tool")
+  local cmd
+  cmd=$(tool_command "$tool")
+  local raw_file="$SCAN_DIR/raw/${tool}.json"
+
+  log_verb "$tool: $cmd"
+
+  local exit_code=0
+  if [[ -n "$TIMEOUT_CMD" ]]; then
+    ( cd "$REPO_ROOT" && eval "$TIMEOUT_CMD" "$timeout_s" bash -c "$cmd" ) > "$raw_file" 2>/dev/null || exit_code=$?
+  else
+    ( cd "$REPO_ROOT" && eval "$cmd" ) > "$raw_file" 2>/dev/null || exit_code=$?
+  fi
+
+  # timeout returns 124; gtimeout also uses 124
+  if [[ $exit_code -eq 124 ]]; then
+    log_warn "$tool timed out after ${timeout_s}s — results incomplete"
+    echo '[]' > "$raw_file"
+    TOOL_ERRORS=$((TOOL_ERRORS + 1))
+    return 1
+  fi
+
+  # Most tools use exit 1 for "findings present" — that's not an error
+  # Exit codes > 1 (excluding 3 for govulncheck) are actual errors
+  case "$tool" in
+    govulncheck)
+      if [[ $exit_code -gt 3 ]]; then
+        log_warn "$tool failed (exit $exit_code)"
+        TOOL_ERRORS=$((TOOL_ERRORS + 1))
+      fi ;;
+    *)
+      if [[ $exit_code -gt 1 ]]; then
+        log_warn "$tool failed (exit $exit_code)"
+        TOOL_ERRORS=$((TOOL_ERRORS + 1))
+      fi ;;
+  esac
+
+  return 0
+}
+
+run_all_tools() {
+  log_info "Running ${#TOOLS_RUN[@]} tool(s)..."
+  echo ""
+
+  if $OPT_PARALLEL; then
+    local pids=()
+    local pid_tool=()
+    for tool in "${TOOLS_RUN[@]}"; do
+      log "  ${BLUE}▸${RESET} $tool"
+      run_single_tool "$tool" &
+      pids+=($!)
+      pid_tool+=("$tool")
+    done
+
+    local i=0
+    for pid in "${pids[@]}"; do
+      wait "$pid" 2>/dev/null || true
+      i=$((i + 1))
+    done
+  else
+    for tool in "${TOOLS_RUN[@]}"; do
+      log "  ${BLUE}▸${RESET} $tool"
+      run_single_tool "$tool" || true
+    done
+  fi
+
+  echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PER-TOOL PARSERS  (raw JSON → unified findings)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Redact a secret: show first 3 and last 3 chars
+redact_secret() {
+  local s="$1"
+  local len=${#s}
+  if [[ $len -le 6 ]]; then
+    echo "***"
+  else
+    echo "${s:0:3}...${s: -3}"
+  fi
+}
+
+parse_gitleaks() {
+  local raw="$SCAN_DIR/raw/gitleaks.json"
+  [[ -s "$raw" ]] || { echo '[]'; return; }
+  jq -r --arg tool gitleaks '
+    [.[] | {
+      id: ("gitleaks-" + (input_line_number | tostring)),
+      tool: $tool,
+      category: "secrets",
+      severity: "High",
+      severity_rank: 1,
+      rule_id: .RuleID,
+      title: (.RuleID | gsub("-"; " ") | gsub("_"; " ")),
+      description: (.Description // "Secret detected"),
+      file: .File,
+      line: .StartLine,
+      code_snippet: ((.Secret // "")[0:3] + "..." + ((.Secret // "")[-3:] // "")),
+      remediation: "Move to environment variable or secrets manager",
+      cve: null,
+      cwe: "CWE-798",
+      package: null,
+      installed_version: null,
+      fix_version: null
+    }]
+  ' "$raw" 2>/dev/null || echo '[]'
+}
+
+parse_pip_audit() {
+  local raw="$SCAN_DIR/raw/pip-audit.json"
+  [[ -s "$raw" ]] || { echo '[]'; return; }
+  jq -r --arg tool pip-audit '
+    [.dependencies[]? | select(.vulns | length > 0) |
+      .name as $pkg | .version as $ver |
+      .vulns[] | {
+        id: ("pip-audit-" + .id),
+        tool: $tool,
+        category: "dependency",
+        severity: (if .fix_versions | length > 0 then "High" else "Medium" end),
+        severity_rank: (if .fix_versions | length > 0 then 1 else 2 end),
+        rule_id: .id,
+        title: ($pkg + " " + .id),
+        description: (.description // "Vulnerable dependency"),
+        file: "requirements.txt",
+        line: null,
+        code_snippet: null,
+        remediation: ("Upgrade " + $pkg + " to " + ((.fix_versions // ["latest"])[0] // "latest")),
+        cve: .id,
+        cwe: null,
+        package: $pkg,
+        installed_version: $ver,
+        fix_version: ((.fix_versions // [])[0] // null)
+      }
+    ]
+  ' "$raw" 2>/dev/null || echo '[]'
+}
+
+parse_npm_audit() {
+  local raw="$SCAN_DIR/raw/npm-audit.json"
+  [[ -s "$raw" ]] || { echo '[]'; return; }
+  jq -r --arg tool npm-audit '
+    def map_sev:
+      if . == "critical" then "Critical"
+      elif . == "high" then "High"
+      elif . == "moderate" then "Medium"
+      else "Low" end;
+    def sev_rank:
+      if . == "Critical" then 0
+      elif . == "High" then 1
+      elif . == "Medium" then 2
+      else 3 end;
+    [.vulnerabilities? // {} | to_entries[] | .value | {
+      id: ("npm-audit-" + .name),
+      tool: $tool,
+      category: "dependency",
+      severity: (.severity | map_sev),
+      severity_rank: (.severity | map_sev | sev_rank),
+      rule_id: .name,
+      title: (.name + " vulnerability"),
+      description: (if .via | type == "array" then
+        (.via[] | if type == "object" then .title // .url // "Vulnerability" else . end) // "Vulnerability"
+      else "Vulnerability" end),
+      file: "package.json",
+      line: null,
+      code_snippet: null,
+      remediation: (if .fixAvailable then "Run npm audit fix" else "Manual upgrade required" end),
+      cve: null,
+      cwe: null,
+      package: .name,
+      installed_version: (.range // null),
+      fix_version: null
+    }]
+  ' "$raw" 2>/dev/null || echo '[]'
+}
+
+parse_trivy() {
+  local raw="$SCAN_DIR/raw/trivy.json"
+  [[ -s "$raw" ]] || { echo '[]'; return; }
+  jq -r --arg tool trivy '
+    def map_sev:
+      if . == "CRITICAL" then "Critical"
+      elif . == "HIGH" then "High"
+      elif . == "MEDIUM" then "Medium"
+      else "Low" end;
+    def sev_rank:
+      if . == "Critical" then 0
+      elif . == "High" then 1
+      elif . == "Medium" then 2
+      else 3 end;
+    [.Results[]? | .Vulnerabilities[]? | {
+      id: ("trivy-" + .VulnerabilityID),
+      tool: $tool,
+      category: "dependency",
+      severity: (.Severity | map_sev),
+      severity_rank: (.Severity | map_sev | sev_rank),
+      rule_id: .VulnerabilityID,
+      title: (.Title // .VulnerabilityID),
+      description: (.Description // "Vulnerable dependency"),
+      file: null,
+      line: null,
+      code_snippet: null,
+      remediation: ("Upgrade " + .PkgName + " to " + (.FixedVersion // "latest")),
+      cve: .VulnerabilityID,
+      cwe: null,
+      package: .PkgName,
+      installed_version: .InstalledVersion,
+      fix_version: (.FixedVersion // null)
+    }]
+  ' "$raw" 2>/dev/null || echo '[]'
+}
+
+parse_bandit() {
+  local raw="$SCAN_DIR/raw/bandit.json"
+  [[ -s "$raw" ]] || { echo '[]'; return; }
+  jq -r --arg tool bandit '
+    def map_sev:
+      if .issue_severity == "HIGH" and .issue_confidence == "HIGH" then "High"
+      elif .issue_severity == "HIGH" then "Medium"
+      elif .issue_severity == "MEDIUM" then "Medium"
+      else "Low" end;
+    def sev_rank:
+      if . == "High" then 1
+      elif . == "Medium" then 2
+      else 3 end;
+    [.results[]? | . as $r | {
+      id: ("bandit-" + .test_id + "-" + (.line_number | tostring)),
+      tool: $tool,
+      category: "sast",
+      severity: ($r | map_sev),
+      severity_rank: ($r | map_sev | sev_rank),
+      rule_id: .test_id,
+      title: .test_name,
+      description: .issue_text,
+      file: .filename,
+      line: .line_number,
+      code_snippet: (.code | gsub("\n$"; "")),
+      remediation: ("Review " + .test_name + " finding"),
+      cve: null,
+      cwe: (.issue_cwe.id // null | if . then "CWE-" + tostring else null end),
+      package: null,
+      installed_version: null,
+      fix_version: null
+    }]
+  ' "$raw" 2>/dev/null || echo '[]'
+}
+
+parse_shellcheck() {
+  local raw="$SCAN_DIR/raw/shellcheck.json"
+  [[ -s "$raw" ]] || { echo '[]'; return; }
+  jq -r --arg tool shellcheck '
+    def security_rules: [2086, 2091, 2046, 2116];
+    def map_sev:
+      if (.code | IN(security_rules[])) then "High"
+      elif .level == "error" then "High"
+      elif .level == "warning" then "Medium"
+      else "Low" end;
+    def sev_rank:
+      if . == "High" then 1
+      elif . == "Medium" then 2
+      else 3 end;
+    [.[]? | {
+      id: ("shellcheck-SC" + (.code | tostring) + "-" + .file + ":" + (.line | tostring)),
+      tool: $tool,
+      category: "shell",
+      severity: (. | map_sev),
+      severity_rank: (. | map_sev | sev_rank),
+      rule_id: ("SC" + (.code | tostring)),
+      title: ("SC" + (.code | tostring) + ": " + .message),
+      description: .message,
+      file: .file,
+      line: .line,
+      code_snippet: null,
+      remediation: ("See https://www.shellcheck.net/wiki/SC" + (.code | tostring)),
+      cve: null,
+      cwe: null,
+      package: null,
+      installed_version: null,
+      fix_version: null
+    }]
+  ' "$raw" 2>/dev/null || echo '[]'
+}
+
+parse_hadolint() {
+  local raw="$SCAN_DIR/raw/hadolint.json"
+  [[ -s "$raw" ]] || { echo '[]'; return; }
+  jq -r --arg tool hadolint '
+    def security_rules: ["DL3000","DL3002","DL3004","DL3006","DL3009","DL3018","DL3019"];
+    def map_sev:
+      if (.code | IN(security_rules[])) then "High"
+      elif .level == "error" then "High"
+      elif .level == "warning" then "Medium"
+      else "Low" end;
+    def sev_rank:
+      if . == "High" then 1
+      elif . == "Medium" then 2
+      else 3 end;
+    [.[]? | {
+      id: ("hadolint-" + .code + "-" + .file + ":" + (.line | tostring)),
+      tool: $tool,
+      category: "container",
+      severity: (. | map_sev),
+      severity_rank: (. | map_sev | sev_rank),
+      rule_id: .code,
+      title: (.code + ": " + .message),
+      description: .message,
+      file: .file,
+      line: .line,
+      code_snippet: null,
+      remediation: ("See https://github.com/hadolint/hadolint/wiki/" + .code),
+      cve: null,
+      cwe: null,
+      package: null,
+      installed_version: null,
+      fix_version: null
+    }]
+  ' "$raw" 2>/dev/null || echo '[]'
+}
+
+parse_sast() {
+  local raw="$SCAN_DIR/raw/sast.json"
+  [[ -s "$raw" ]] || { echo '[]'; return; }
+  jq -r --arg tool sast '
+    def map_sev:
+      if .extra.severity == "ERROR" then "High"
+      elif .extra.severity == "WARNING" then "Medium"
+      else "Low" end;
+    def sev_rank:
+      if . == "High" then 1
+      elif . == "Medium" then 2
+      else 3 end;
+    [.results[]? | {
+      id: ("sast-" + .check_id + "-" + .path + ":" + (.start.line | tostring)),
+      tool: $tool,
+      category: "sast",
+      severity: (. | map_sev),
+      severity_rank: (. | map_sev | sev_rank),
+      rule_id: .check_id,
+      title: (.check_id | split(".") | last),
+      description: .extra.message,
+      file: .path,
+      line: .start.line,
+      code_snippet: (.extra.lines // null),
+      remediation: (.extra.metadata.fix // "Review finding"),
+      cve: null,
+      cwe: ((.extra.metadata.cwe // []) | if length > 0 then .[0] else null end),
+      package: null,
+      installed_version: null,
+      fix_version: null
+    }]
+  ' "$raw" 2>/dev/null || echo '[]'
+}
+
+parse_checkov() {
+  local raw="$SCAN_DIR/raw/checkov.json"
+  [[ -s "$raw" ]] || { echo '[]'; return; }
+  jq -r --arg tool checkov '
+    def is_high: (.check_id | test("CKV_AWS_[0-9]+")) and
+      ((.check_id | test("encrypt|iam|public|access"; "i")) or
+       (.name | test("encrypt|iam|public|access"; "i")));
+    def map_sev:
+      if is_high then "High"
+      elif (.name | test("log|version|tag"; "i")) then "Medium"
+      else "Low" end;
+    def sev_rank:
+      if . == "High" then 1
+      elif . == "Medium" then 2
+      else 3 end;
+    [(.results.failed_checks // [])[] | {
+      id: ("checkov-" + .check_id + "-" + .file_path),
+      tool: $tool,
+      category: "iac",
+      severity: (. | map_sev),
+      severity_rank: (. | map_sev | sev_rank),
+      rule_id: .check_id,
+      title: .name,
+      description: .name,
+      file: .file_path,
+      line: (.file_line_range[0] // null),
+      code_snippet: null,
+      remediation: (.guideline // "See checkov documentation"),
+      cve: null,
+      cwe: null,
+      package: null,
+      installed_version: null,
+      fix_version: null
+    }]
+  ' "$raw" 2>/dev/null || echo '[]'
+}
+
+parse_govulncheck() {
+  local raw="$SCAN_DIR/raw/govulncheck.json"
+  [[ -s "$raw" ]] || { echo '[]'; return; }
+  # govulncheck outputs newline-delimited JSON objects, not an array
+  jq -rs --arg tool govulncheck '
+    [.[] | select(.finding?) | .finding | {
+      id: ("govulncheck-" + .osv),
+      tool: $tool,
+      category: "dependency",
+      severity: (if (.trace // []) | any(.function?) then "High" else "Medium" end),
+      severity_rank: (if (.trace // []) | any(.function?) then 1 else 2 end),
+      rule_id: .osv,
+      title: .osv,
+      description: ("Go vulnerability " + .osv),
+      file: ((.trace // [{}])[0].position.filename // null),
+      line: ((.trace // [{}])[0].position.line // null),
+      code_snippet: null,
+      remediation: ("Update affected Go module"),
+      cve: null,
+      cwe: null,
+      package: ((.trace // [{}])[0].module // null),
+      installed_version: null,
+      fix_version: (.fixed_version // null)
+    }] | unique_by(.id)
+  ' "$raw" 2>/dev/null || echo '[]'
+}
+
+parse_cargo_audit() {
+  local raw="$SCAN_DIR/raw/cargo-audit.json"
+  [[ -s "$raw" ]] || { echo '[]'; return; }
+  jq -r --arg tool cargo-audit '
+    def map_sev:
+      if .advisory.severity == "critical" then "Critical"
+      elif .advisory.severity == "high" then "High"
+      elif .advisory.severity == "medium" then "Medium"
+      else "Low" end;
+    def sev_rank:
+      if . == "Critical" then 0
+      elif . == "High" then 1
+      elif . == "Medium" then 2
+      else 3 end;
+    [(.vulnerabilities.list // [])[] | {
+      id: ("cargo-audit-" + .advisory.id),
+      tool: $tool,
+      category: "dependency",
+      severity: (. | map_sev),
+      severity_rank: (. | map_sev | sev_rank),
+      rule_id: .advisory.id,
+      title: .advisory.title,
+      description: .advisory.description,
+      file: "Cargo.toml",
+      line: null,
+      code_snippet: null,
+      remediation: ("Upgrade " + .package.name + " (patched: " + ((.versions.patched // []) | join(", ")) + ")"),
+      cve: (.advisory.id),
+      cwe: null,
+      package: .package.name,
+      installed_version: .package.version,
+      fix_version: ((.versions.patched // [])[0] // null)
+    }]
+  ' "$raw" 2>/dev/null || echo '[]'
+}
+
+parse_bundler_audit() {
+  local raw="$SCAN_DIR/raw/bundler-audit.json"
+  [[ -s "$raw" ]] || { echo '[]'; return; }
+  jq -r --arg tool bundler-audit '
+    def map_sev:
+      if .advisory.criticality == "high" then "High"
+      elif .advisory.criticality == "medium" then "Medium"
+      else "Low" end;
+    def sev_rank:
+      if . == "High" then 1
+      elif . == "Medium" then 2
+      else 3 end;
+    [(.results // [])[] | {
+      id: ("bundler-audit-" + .advisory.id),
+      tool: $tool,
+      category: "dependency",
+      severity: (. | map_sev),
+      severity_rank: (. | map_sev | sev_rank),
+      rule_id: .advisory.id,
+      title: .advisory.title,
+      description: .advisory.title,
+      file: "Gemfile",
+      line: null,
+      code_snippet: null,
+      remediation: ("Upgrade " + .gem.name),
+      cve: .advisory.id,
+      cwe: null,
+      package: .gem.name,
+      installed_version: .gem.version,
+      fix_version: null
+    }]
+  ' "$raw" 2>/dev/null || echo '[]'
+}
+
+# ── Normalize and merge all findings ──────────────────────────────────────────
+
+normalize_findings() {
+  local all_findings="$SCAN_DIR/all_findings.json"
+  echo '[]' > "$all_findings"
+
+  for tool in "${TOOLS_RUN[@]}"; do
+    local parsed
+    case "$tool" in
+      gitleaks)      parsed=$(parse_gitleaks) ;;
+      pip-audit)     parsed=$(parse_pip_audit) ;;
+      npm-audit)     parsed=$(parse_npm_audit) ;;
+      trivy)         parsed=$(parse_trivy) ;;
+      bandit)        parsed=$(parse_bandit) ;;
+      shellcheck)    parsed=$(parse_shellcheck) ;;
+      hadolint)      parsed=$(parse_hadolint) ;;
+      sast)          parsed=$(parse_sast) ;;
+      checkov)       parsed=$(parse_checkov) ;;
+      govulncheck)   parsed=$(parse_govulncheck) ;;
+      cargo-audit)   parsed=$(parse_cargo_audit) ;;
+      bundler-audit) parsed=$(parse_bundler_audit) ;;
+      *) parsed='[]' ;;
+    esac
+
+    # Merge into all_findings
+    local merged
+    merged=$(jq -s '.[0] + .[1]' "$all_findings" <(echo "$parsed") 2>/dev/null) || merged=$(cat "$all_findings")
+    echo "$merged" > "$all_findings"
+  done
+}
+
+# ── Deduplication ─────────────────────────────────────────────────────────────
+
+deduplicate_findings() {
+  local all="$SCAN_DIR/all_findings.json"
+  local deduped_file="$SCAN_DIR/findings.json"
+
+  # Deduplicate: same file+line+rule_id → keep lowest severity_rank (highest severity)
+  # Same CVE → keep entry with most detail (lowest severity_rank as tiebreak)
+  jq '
+    # Group by file+line+rule_id, keep highest severity
+    group_by(.file + ":" + (.line // 0 | tostring) + ":" + .rule_id) |
+    map(sort_by(.severity_rank) | first) |
+
+    # Then deduplicate by CVE where present
+    (map(select(.cve != null)) | group_by(.cve) | map(sort_by(.severity_rank) | first)) +
+    (map(select(.cve == null))) |
+
+    # Sort by severity_rank, then file
+    sort_by(.severity_rank, .file, .line)
+  ' "$all" > "$deduped_file" 2>/dev/null || cp "$all" "$deduped_file"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  REPORT GENERATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+generate_report() {
+  local findings="$SCAN_DIR/findings.json"
+  local report="$SCAN_DIR/report.md"
+
+  local critical high medium low total
+  critical=$(jq '[.[] | select(.severity == "Critical")] | length' "$findings")
+  high=$(jq '[.[] | select(.severity == "High")] | length' "$findings")
+  medium=$(jq '[.[] | select(.severity == "Medium")] | length' "$findings")
+  low=$(jq '[.[] | select(.severity == "Low")] | length' "$findings")
+  total=$(jq 'length' "$findings")
+  local duration=$(( $(date +%s) - SCAN_START ))
+
+  # Build report
+  {
+    echo "# Security Audit Report"
+    echo ""
+    echo "**Repository**: $REPO_NAME"
+    echo "**Branch**: $REPO_BRANCH"
+    echo "**Date**: $(date +%Y-%m-%d)"
+    echo "**Profile**: $PROFILE"
+    echo "**Duration**: ${duration}s"
+    echo ""
+    echo "## Summary"
+    echo ""
+    echo "| Severity | Count |"
+    echo "|----------|-------|"
+    echo "| Critical | $critical |"
+    echo "| High     | $high |"
+    echo "| Medium   | $medium |"
+    echo "| Low      | $low |"
+    echo "| **Total** | **$total** |"
+    echo ""
+    echo "**Tools run**: ${TOOLS_RUN[*]}"
+    [[ ${#TOOLS_SKIPPED[@]} -gt 0 ]] && echo "**Tools skipped**: ${TOOLS_SKIPPED[*]+"${TOOLS_SKIPPED[*]}"}"
+    echo ""
+    echo "---"
+    echo ""
+
+    # Critical & High findings
+    if [[ $((critical + high)) -gt 0 ]]; then
+      echo "## Critical & High Findings"
+      echo ""
+      echo "> Findings that require immediate attention. Fix before merge."
+      echo ""
+      jq -r '
+        [.[] | select(.severity == "Critical" or .severity == "High")] |
+        to_entries[] |
+        "### " + ((.key + 1) | tostring) + ". " + .value.title + "\n" +
+        "- **Severity**: " + .value.severity + "\n" +
+        "- **Source**: " + .value.tool + " (" + .value.rule_id + ")\n" +
+        "- **Location**: `" + (.value.file // "n/a") + (if .value.line then ":" + (.value.line | tostring) else "" end) + "`\n" +
+        (if .value.cwe then "- **CWE**: " + .value.cwe + "\n" else "" end) +
+        (if .value.cve then "- **CVE**: " + .value.cve + "\n" else "" end) +
+        "\n**Description**: " + .value.description + "\n" +
+        (if .value.code_snippet then "\n```\n" + .value.code_snippet + "\n```\n" else "" end) +
+        "\n**Remediation**: " + .value.remediation + "\n\n---\n"
+      ' "$findings"
+    fi
+
+    # Medium findings
+    if [[ $medium -gt 0 ]]; then
+      echo "## Medium Findings"
+      echo ""
+      echo "> Potential issues that should be reviewed and planned for fix."
+      echo ""
+      jq -r '
+        [.[] | select(.severity == "Medium")] |
+        to_entries[] |
+        "### " + ((.key + 1) | tostring) + ". " + .value.title + "\n" +
+        "- **Severity**: Medium\n" +
+        "- **Source**: " + .value.tool + " (" + .value.rule_id + ")\n" +
+        "- **Location**: `" + (.value.file // "n/a") + (if .value.line then ":" + (.value.line | tostring) else "" end) + "`\n" +
+        "\n**Description**: " + .value.description + "\n" +
+        "\n**Remediation**: " + .value.remediation + "\n\n---\n"
+      ' "$findings"
+    fi
+
+    # Low findings (table)
+    if [[ $low -gt 0 ]]; then
+      echo "## Low Findings"
+      echo ""
+      echo "> Best practices and informational items."
+      echo ""
+      echo "| # | Location | Source | Description |"
+      echo "|---|----------|--------|-------------|"
+      jq -r '
+        [.[] | select(.severity == "Low")] |
+        to_entries[] |
+        "| " + ((.key + 1) | tostring) + " | `" +
+        (.value.file // "n/a") + (if .value.line then ":" + (.value.line | tostring) else "" end) +
+        "` | " + .value.tool + " | " + (.value.description | .[0:80]) + " |"
+      ' "$findings"
+      echo ""
+    fi
+
+    # Dependency table
+    local dep_count
+    dep_count=$(jq '[.[] | select(.category == "dependency")] | length' "$findings")
+    if [[ $dep_count -gt 0 ]]; then
+      echo "## Dependency Vulnerabilities"
+      echo ""
+      echo "| Package | Version | CVE/Advisory | Severity | Fix Version | Tool |"
+      echo "|---------|---------|-------------|----------|-------------|------|"
+      jq -r '
+        [.[] | select(.category == "dependency")] | .[] |
+        "| " + (.package // "n/a") + " | " + (.installed_version // "n/a") + " | " +
+        (.cve // "n/a") + " | " + .severity + " | " + (.fix_version // "n/a") + " | " + .tool + " |"
+      ' "$findings"
+      echo ""
+    fi
+
+    echo "---"
+    echo ""
+    echo "*Report generated by security-audit CLI v${VERSION} on $(date +%Y-%m-%d).*"
+  } > "$report"
+}
+
+generate_meta() {
+  local findings="$SCAN_DIR/findings.json"
+  local duration=$(( $(date +%s) - SCAN_START ))
+
+  jq -n \
+    --arg repo "$REPO_NAME" \
+    --arg branch "$REPO_BRANCH" \
+    --arg profile "$PROFILE" \
+    --arg duration "$duration" \
+    --arg tools_run "${TOOLS_RUN[*]}" \
+    --arg tools_skipped "${TOOLS_SKIPPED[*]+"${TOOLS_SKIPPED[*]}"}" \
+    --arg langs "$DETECTED_LANGS" \
+    --argjson critical "$(jq '[.[] | select(.severity == "Critical")] | length' "$findings")" \
+    --argjson high "$(jq '[.[] | select(.severity == "High")] | length' "$findings")" \
+    --argjson medium "$(jq '[.[] | select(.severity == "Medium")] | length' "$findings")" \
+    --argjson low "$(jq '[.[] | select(.severity == "Low")] | length' "$findings")" \
+    '{
+      repo: $repo,
+      branch: $branch,
+      profile: $profile,
+      duration_seconds: ($duration | tonumber),
+      tools_run: ($tools_run | split(" ")),
+      tools_skipped: ($tools_skipped | split(" ") | map(select(. != ""))),
+      languages: ($langs | split(" ") | map(select(. != ""))),
+      findings: { critical: $critical, high: $high, medium: $medium, low: $low,
+                  total: ($critical + $high + $medium + $low) },
+      timestamp: now | todate
+    }' > "$SCAN_DIR/meta.json"
+}
+
+# ── Print summary to terminal ─────────────────────────────────────────────────
+
+print_summary() {
+  local findings="$SCAN_DIR/findings.json"
+  local critical high medium low total
+  critical=$(jq '[.[] | select(.severity == "Critical")] | length' "$findings")
+  high=$(jq '[.[] | select(.severity == "High")] | length' "$findings")
+  medium=$(jq '[.[] | select(.severity == "Medium")] | length' "$findings")
+  low=$(jq '[.[] | select(.severity == "Low")] | length' "$findings")
+  total=$(jq 'length' "$findings")
+  local duration=$(( $(date +%s) - SCAN_START ))
+
+  printf '%b\n' "${BOLD}Security Audit Summary — ${PROFILE} profile${RESET}"
+  echo ""
+  printf '%b\n' "${BOLD}Repository${RESET}: $REPO_NAME"
+  printf '%b\n' "${BOLD}Branch${RESET}: $REPO_BRANCH"
+  printf '%b\n' "${BOLD}Duration${RESET}: ${duration}s"
+  printf '%b\n' "${BOLD}Tools run${RESET}: ${TOOLS_RUN[*]}"
+  [[ ${#TOOLS_SKIPPED[@]} -gt 0 ]] && printf '%b\n' "${BOLD}Tools skipped${RESET}: ${TOOLS_SKIPPED[*]+"${TOOLS_SKIPPED[*]}"}"
+  echo ""
+
+  # Severity table
+  printf "  %-10s %s\n" "Severity" "Count"
+  printf "  %-10s %s\n" "--------" "-----"
+  [[ $critical -gt 0 ]] && printf "  ${RED}%-10s %d${RESET}\n" "Critical" "$critical"
+  [[ $high -gt 0 ]]     && printf "  ${RED}%-10s %d${RESET}\n" "High" "$high"
+  [[ $medium -gt 0 ]]   && printf "  ${YELLOW}%-10s %d${RESET}\n" "Medium" "$medium"
+  [[ $low -gt 0 ]]      && printf "  ${DIM}%-10s %d${RESET}\n" "Low" "$low"
+  printf "  %-10s %d\n" "Total" "$total"
+  echo ""
+
+  # Top findings
+  if [[ $total -gt 0 ]]; then
+    printf '%b\n' "${BOLD}Top Findings:${RESET}"
+    jq -r '
+      .[0:10] | to_entries[] |
+      "  " + ((.key + 1) | tostring) + ". [" + .value.severity + "] " +
+      (.value.file // "n/a") +
+      (if .value.line then ":" + (.value.line | tostring) else "" end) +
+      " — " + .value.title + " (" + .value.tool + ")"
+    ' "$findings"
+    echo ""
+  fi
+
+  printf '%b\n' "${DIM}Report: $SCAN_DIR/report.md${RESET}"
+}
+
+# ── Update latest symlink ─────────────────────────────────────────────────────
+
+update_latest_symlink() {
+  local latest="$REPO_DIR/latest"
+  rm -f "$latest"
+  ln -sf "$SCAN_DIR" "$latest"
+}
+
+# ── Exit code calculation ─────────────────────────────────────────────────────
+
+compute_exit_code() {
+  if [[ $TOOL_ERRORS -gt 0 ]]; then
+    echo 2
+    return
+  fi
+
+  local findings="$SCAN_DIR/findings.json"
+  local medium_plus
+  medium_plus=$(jq '[.[] | select(.severity_rank <= 2)] | length' "$findings")
+
+  if [[ $medium_plus -gt 0 ]]; then
+    echo 1
+  else
+    echo 0
+  fi
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  REPORT SUBCOMMAND
+# ══════════════════════════════════════════════════════════════════════════════
+
+cmd_report() {
+  detect_repo
+
+  if $RPT_LIST; then
+    local scans_dir="$REPO_DIR/scans"
+    if [[ ! -d "$scans_dir" ]]; then
+      log "No scans found for $REPO_NAME"
+      return 0
+    fi
+    printf '%b\n' "${BOLD}Stored scans for ${REPO_NAME}:${RESET}"
+    for d in "$scans_dir"/*/; do
+      [[ -d "$d" ]] || continue
+      local ts
+      ts=$(basename "$d")
+      if [[ -f "$d/meta.json" ]]; then
+        local profile findings_total
+        profile=$(jq -r '.profile' "$d/meta.json")
+        findings_total=$(jq -r '.findings.total' "$d/meta.json")
+        printf "  %s  profile=%-8s  findings=%s\n" "$ts" "$profile" "$findings_total"
+      else
+        printf "  %s\n" "$ts"
+      fi
+    done
+    return 0
+  fi
+
+  # --latest (default)
+  local latest="$REPO_DIR/latest"
+  if [[ ! -L "$latest" ]] && [[ ! -d "$latest" ]]; then
+    die "No scans found for $REPO_NAME. Run 'security-audit' first."
+  fi
+
+  local report_file
+  report_file=$(readlink -f "$latest" 2>/dev/null || readlink "$latest")/report.md
+  if [[ ! -f "$report_file" ]]; then
+    die "No report found in latest scan."
+  fi
+
+  if $OPT_STDOUT; then
+    cat "$report_file"
+  else
+    log_info "Latest report: $report_file"
+    echo ""
+    # Print summary from meta.json
+    local meta
+    meta=$(dirname "$report_file")/meta.json
+    if [[ -f "$meta" ]]; then
+      jq -r '
+        "Repository: " + .repo + "\n" +
+        "Branch: " + .branch + "\n" +
+        "Profile: " + .profile + "\n" +
+        "Duration: " + (.duration_seconds | tostring) + "s\n" +
+        "Findings: " + (.findings.total | tostring) +
+        " (C:" + (.findings.critical | tostring) +
+        " H:" + (.findings.high | tostring) +
+        " M:" + (.findings.medium | tostring) +
+        " L:" + (.findings.low | tostring) + ")"
+      ' "$meta"
+    fi
+    echo ""
+    log "Use --stdout to print full report, or view:"
+    log "  $report_file"
+  fi
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SCAN SUBCOMMAND (main workflow)
+# ══════════════════════════════════════════════════════════════════════════════
+
+cmd_scan() {
+  # Require jq
+  has jq || die "jq is required. Run 'security-audit setup' first."
+
+  detect_repo
+  detect_timeout_cmd
+
+  printf '%b\n' "${BOLD}Security Audit — ${PROFILE} profile${RESET}"
+  printf '%b\n' "${DIM}Repository: ${REPO_ROOT}${RESET}"
+  echo ""
+
+  # Step 1: Init scan dir
+  init_scan_dir
+
+  # Step 2: Detect languages
+  detect_languages
+  if [[ -n "$DETECTED_LANGS" ]]; then
+    log_info "Languages: $DETECTED_LANGS"
+  else
+    log_info "No specific languages detected"
+  fi
+
+  # Step 3: Build tool plan
+  build_tool_plan
+  [[ -z "$TOOL_PLAN" ]] && { log_warn "No tools to run."; return 0; }
+
+  # Step 4: Check availability
+  check_tool_availability
+  [[ -z "$TOOL_PLAN" ]] && { log_warn "No available tools. Run 'security-audit setup'."; return 0; }
+
+  # Convert plan to array
+  read -ra TOOLS_RUN <<< "$TOOL_PLAN"
+
+  # Step 5: Execute tools
+  run_all_tools
+
+  # Step 6: Normalize findings
+  log_info "Parsing results..."
+  normalize_findings
+
+  # Step 7: Deduplicate
+  deduplicate_findings
+
+  # Step 8: Generate report
+  generate_report
+  generate_meta
+
+  # Step 9: Finalize
+  update_latest_symlink
+  echo ""
+  print_summary
+
+  # Handle --stdout / --json
+  if $OPT_STDOUT; then
+    echo ""
+    echo "---"
+    echo ""
+    cat "$SCAN_DIR/report.md"
+  fi
+
+  if $OPT_JSON; then
+    cat "$SCAN_DIR/findings.json"
+  fi
+
+  local exit_code
+  exit_code=$(compute_exit_code)
+  exit "$exit_code"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+main() {
+  parse_args "$@"
+
+  case "$SUBCMD" in
+    help)    print_help ;;
+    version) echo "security-audit v${VERSION}" ;;
+    setup)   cmd_setup ;;
+    report)  cmd_report ;;
+    scan)    cmd_scan ;;
+    *)       die "Unknown command: $SUBCMD" ;;
+  esac
+}
+
+main "$@"

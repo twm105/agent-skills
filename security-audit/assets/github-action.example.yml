@@ -1,0 +1,184 @@
+# .github/workflows/security-audit.yml
+#
+# Security audit workflow for GitHub Actions.
+# Copy this file to .github/workflows/ in your repository.
+#
+# Runs quick scan on PRs, standard scan on weekly schedule.
+
+name: Security Audit
+
+on:
+  pull_request:
+    branches: [main, master]
+  schedule:
+    # Weekly scan — Mondays at 06:00 UTC
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'Scan profile'
+        required: false
+        default: 'standard'
+        type: choice
+        options:
+          - quick
+          - standard
+          - deep
+
+permissions:
+  contents: read
+  security-events: write  # For SARIF upload
+
+jobs:
+  security-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for gitleaks
+
+      # --- Tool Installation ---
+
+      - name: Install gitleaks
+        run: |
+          GITLEAKS_VERSION=$(curl -s https://api.github.com/repos/gitleaks/gitleaks/releases/latest | jq -r .tag_name)
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION#v}_linux_x64.tar.gz" | tar xz -C /usr/local/bin gitleaks
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python tools
+        run: pip install bandit
+
+      - name: Install opengrep
+        run: curl -fsSL https://raw.githubusercontent.com/opengrep/opengrep/main/install.sh | bash
+
+      - name: Set up Node (if needed)
+        if: hashFiles('package.json') != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install shellcheck
+        run: sudo apt-get install -y shellcheck
+
+      - name: Cache trivy DB
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: trivy-db-${{ runner.os }}-
+
+      - name: Install trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+      # --- Secrets Detection ---
+
+      - name: Gitleaks (PR commits)
+        if: github.event_name == 'pull_request'
+        run: |
+          gitleaks detect --source . --no-banner \
+            --log-opts="${{ github.event.pull_request.base.sha }}..${{ github.sha }}" \
+            --report-format sarif --report-path gitleaks.sarif
+        continue-on-error: true
+
+      - name: Gitleaks (full history — scheduled)
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: |
+          gitleaks detect --source . --no-banner \
+            --report-format sarif --report-path gitleaks.sarif
+        continue-on-error: true
+
+      # --- Dependency Scanning ---
+
+      # pip-audit skipped — requires Python ≤3.13 + active venv.
+      # trivy fs (below) covers Python deps via requirements.txt / pyproject.toml.
+
+      - name: npm audit
+        if: hashFiles('package.json') != ''
+        run: npm audit --json > npm-audit.json || true
+
+      - name: trivy (filesystem)
+        run: |
+          trivy fs --format json --severity HIGH,CRITICAL --quiet . \
+            -o trivy-results.json || true
+
+      # --- Static Analysis (standard/deep or scheduled) ---
+
+      - name: Opengrep
+        if: github.event_name != 'pull_request' || inputs.profile != 'quick'
+        run: |
+          opengrep scan --config=auto --json --quiet . \
+            > opengrep-results.json 2>/dev/null || true
+
+      - name: Bandit
+        if: (github.event_name != 'pull_request' || inputs.profile != 'quick') && hashFiles('*.py', '**/*.py') != ''
+        run: bandit -r . -f json --severity-level medium -o bandit-results.json || true
+
+      - name: ShellCheck
+        if: (github.event_name != 'pull_request' || inputs.profile != 'quick') && hashFiles('*.sh', '**/*.sh') != ''
+        run: |
+          find . -name '*.sh' -o -name '*.bash' -o -name '*.zsh' | \
+            xargs shellcheck -f json --severity=warning > shellcheck-results.json 2>/dev/null || true
+
+      # --- Upload Results ---
+
+      - name: Upload SARIF (gitleaks)
+        if: always() && hashFiles('gitleaks.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+
+      - name: Upload scan artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-audit-results
+          path: |
+            *-results.json
+            *.sarif
+          retention-days: 30
+
+      # --- Summary ---
+
+      - name: Check results
+        if: always()
+        run: |
+          EXIT_CODE=0
+
+          # Check gitleaks
+          if [[ -f gitleaks.sarif ]]; then
+            GITLEAKS_FINDINGS=$(jq '[.runs[].results[]] | length' gitleaks.sarif 2>/dev/null || echo 0)
+            if [[ "$GITLEAKS_FINDINGS" -gt 0 ]]; then
+              echo "::error::Gitleaks found $GITLEAKS_FINDINGS secret(s)"
+              EXIT_CODE=1
+            fi
+          fi
+
+          # Check trivy
+          if [[ -f trivy-results.json ]]; then
+            TRIVY_FINDINGS=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL" or .Severity == "HIGH")] | length' trivy-results.json 2>/dev/null || echo 0)
+            if [[ "$TRIVY_FINDINGS" -gt 0 ]]; then
+              echo "::error::Trivy found $TRIVY_FINDINGS critical/high vulnerability(ies)"
+              EXIT_CODE=1
+            fi
+          fi
+
+          # Check opengrep
+          if [[ -f opengrep-results.json ]]; then
+            OPENGREP_FINDINGS=$(jq '[.results[] | select(.extra.severity == "ERROR")] | length' opengrep-results.json 2>/dev/null || echo 0)
+            if [[ "$OPENGREP_FINDINGS" -gt 0 ]]; then
+              echo "::error::Opengrep found $OPENGREP_FINDINGS high-severity finding(s)"
+              EXIT_CODE=1
+            fi
+          fi
+
+          echo "Security audit complete. Exit code: $EXIT_CODE"
+          exit $EXIT_CODE

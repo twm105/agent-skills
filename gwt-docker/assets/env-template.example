@@ -1,0 +1,26 @@
+# .env.template — gwt.sh Docker port isolation
+# This file is committed to git. Generated .env files are gitignored.
+#
+# gwt-managed variables use ${VAR} syntax and are substituted per-worktree.
+# Everything else is a literal value shared across all worktrees.
+
+# ─── Project Isolation ────────────────────────────────────────────────────────
+# REQUIRED: isolates Docker networks, volumes, and container names per worktree
+COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME}
+WORKTREE_NAME=${WORKTREE_NAME}
+
+# ─── Port Assignments ────────────────────────────────────────────────────────
+# Each *_PORT variable gets a unique port per worktree (starting from 40000).
+# Order matters: first variable = start_port + 0, second = start_port + 1, etc.
+DB_PORT=${DB_PORT}
+WEB_PORT=${WEB_PORT}
+REDIS_PORT=${REDIS_PORT}
+
+# ─── Database ────────────────────────────────────────────────────────────────
+POSTGRES_DB=myapp_dev
+POSTGRES_USER=dev
+POSTGRES_PASSWORD=devpass
+
+# ─── Application ─────────────────────────────────────────────────────────────
+NODE_ENV=development
+LOG_LEVEL=debug
