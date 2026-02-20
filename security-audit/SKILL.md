@@ -12,7 +12,7 @@ description: >
 ## Quick Reference
 
 ```
-security-audit [scan] [-p quick|standard|deep] [--stdout] [--json]
+security-audit [scan] [-p quick|standard|deep] [--stdout] [--json] [--sarif]
 security-audit setup [--check-only]
 security-audit report [--latest|--list] [--stdout]
 ```
@@ -23,6 +23,7 @@ security-audit report [--latest|--list] [--stdout]
 | `-t, --tool <name>` | Run only specific tool(s), repeatable |
 | `--stdout` | Print full markdown report to terminal |
 | `--json` | Print unified findings JSON to terminal |
+| `--sarif` | Print SARIF 2.1.0 to stdout (for GitHub Security tab) |
 | `-q, --quiet` | Suppress progress output, exit code only |
 
 Reports are stored in `~/.local/share/security-audit/<repo>/` — never in the repo tree.

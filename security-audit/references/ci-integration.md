@@ -77,6 +77,33 @@ The simplest CI integration — run the CLI and use its exit code:
     retention-days: 30
 ```
 
+### SARIF Output for GitHub Security Tab
+
+The `--sarif` flag produces SARIF 2.1.0 output that uploads to GitHub's Security tab. Results are **only visible to people with write access** — even on public repos. This keeps vulnerability details private while the workflow just passes/fails publicly.
+
+```yaml
+permissions:
+  contents: read
+  security-events: write  # Required for SARIF upload
+
+steps:
+  - name: Security audit
+    run: security-audit -p quick -q --sarif > results.sarif
+    continue-on-error: true
+
+  - name: Upload SARIF
+    if: always()
+    uses: github/codeql-action/upload-sarif@v3
+    with:
+      sarif_file: results.sarif
+      category: security-audit
+```
+
+The SARIF output converts all unified findings (from all tools) into a single SARIF file with:
+- Severity mapping: Critical/High → `error`, Medium → `warning`, Low → `note`
+- File locations with line numbers where available
+- Remediation guidance, CVE/CWE references, and package version info in messages
+
 ### Running Individual Tools
 
 For CI, you may prefer running tools directly rather than through the full CLI:
@@ -104,15 +131,22 @@ For CI, you may prefer running tools directly rather than through the full CLI:
 
 ### SARIF Upload
 
-GitHub Security tab can display SARIF-formatted results:
+GitHub Security tab can display SARIF-formatted results. Use the CLI's `--sarif` flag to generate a single SARIF file covering all tools:
 
 ```yaml
+- name: Security audit
+  run: security-audit -p quick -q --sarif > results.sarif
+  continue-on-error: true
+
 - name: Upload SARIF
   if: always()
   uses: github/codeql-action/upload-sarif@v3
   with:
-    sarif_file: gitleaks.sarif
+    sarif_file: results.sarif
+    category: security-audit
 ```
+
+Results uploaded to the Security tab are **only visible to users with write access**, even on public repos.
 
 ### Caching
 

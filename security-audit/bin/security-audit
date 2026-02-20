@@ -74,6 +74,7 @@ SCAN OPTIONS
   -t, --tool <name>                     Run only this tool (repeatable)
       --stdout                          Print full markdown report to stdout
       --json                            Print unified findings JSON to stdout
+      --sarif                           Print SARIF 2.1.0 to stdout (for GitHub Security tab)
       --no-parallel                     Run tools sequentially
   -v, --verbose                         Show tool commands and raw output
   -q, --quiet                           Suppress progress, just exit code
@@ -105,6 +106,7 @@ PROFILE="standard"
 TOOL_FILTER=()
 OPT_STDOUT=false
 OPT_JSON=false
+OPT_SARIF=false
 OPT_PARALLEL=true
 # report subcommand
 RPT_LIST=false
@@ -133,6 +135,7 @@ parse_args() {
         TOOL_FILTER+=("$2"); shift 2 ;;
       --stdout)      OPT_STDOUT=true; shift ;;
       --json)        OPT_JSON=true; shift ;;
+      --sarif)       OPT_SARIF=true; shift ;;
       --no-parallel) OPT_PARALLEL=false; shift ;;
       -v|--verbose)  VERBOSE=true; shift ;;
       -q|--quiet)    QUIET=true; shift ;;
@@ -1232,6 +1235,76 @@ generate_meta() {
     }' > "$SCAN_DIR/meta.json"
 }
 
+# ── SARIF 2.1.0 output ────────────────────────────────────────────────────────
+
+generate_sarif() {
+  local findings="$SCAN_DIR/findings.json"
+  jq --arg version "$VERSION" '
+    def sarif_level:
+      if . == "Critical" or . == "High" then "error"
+      elif . == "Medium" then "warning"
+      else "note" end;
+
+    # Build unique rules list
+    (map({ rule_id, title, description, severity }) | unique_by(.rule_id)) as $rules |
+
+    # Map rule_id to index
+    ($rules | to_entries | map({ (.value.rule_id): .key }) | add // {}) as $rule_index |
+
+    {
+      "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",
+      "version": "2.1.0",
+      "runs": [{
+        "tool": {
+          "driver": {
+            "name": "security-audit",
+            "version": $version,
+            "rules": [
+              $rules[] | {
+                id: .rule_id,
+                shortDescription: { text: .title },
+                fullDescription: { text: .description },
+                defaultConfiguration: {
+                  level: (.severity | sarif_level)
+                }
+              }
+            ]
+          }
+        },
+        "results": [
+          .[] | {
+            ruleId: .rule_id,
+            ruleIndex: ($rule_index[.rule_id] // 0),
+            level: (.severity | sarif_level),
+            message: {
+              text: (
+                .description +
+                (if .remediation then "\n\nRemediation: " + .remediation else "" end) +
+                (if .cve then "\nCVE: " + .cve else "" end) +
+                (if .package then "\nPackage: " + .package +
+                  (if .installed_version then " " + .installed_version else "" end) +
+                  (if .fix_version then " → " + .fix_version else "" end)
+                else "" end)
+              )
+            },
+            locations: [
+              if .file then {
+                physicalLocation: {
+                  artifactLocation: {
+                    uri: (if .file | startswith("./") then .file[2:] else .file end),
+                    uriBaseId: "%SRCROOT%"
+                  },
+                  region: (if .line then { startLine: .line } else {} end)
+                }
+              } else null end
+            ] | map(select(. != null))
+          }
+        ]
+      }]
+    }
+  ' "$findings"
+}
+
 # ── Print summary to terminal ─────────────────────────────────────────────────
 
 print_summary() {
@@ -1441,6 +1514,10 @@ cmd_scan() {
 
   if $OPT_JSON; then
     cat "$SCAN_DIR/findings.json"
+  fi
+
+  if $OPT_SARIF; then
+    generate_sarif
   fi
 
   local exit_code
