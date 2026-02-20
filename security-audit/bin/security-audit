@@ -520,12 +520,12 @@ tool_command() {
     bundler-audit)
       echo "bundler-audit check --format json 2>/dev/null" ;;
     sast)
-      echo "semgrep scan --config=auto --json --quiet . 2>/dev/null" ;;
+      echo "semgrep scan --config=p/security-audit --config=p/owasp-top-ten --json --quiet . 2>/dev/null" ;;
     bandit)
       echo "bandit -r . -f json --severity-level medium 2>/dev/null" ;;
     shellcheck)
-      # Find shell files and pass to shellcheck
-      echo "find . -name '*.sh' -o -name '*.bash' -o -name '*.zsh' | xargs shellcheck -f json --severity=warning 2>/dev/null" ;;
+      # Find shell files and pass to shellcheck (exclude .git and other non-source dirs)
+      echo "find . -not -path './.git/*' -not -path './node_modules/*' -not -path './.venv/*' \\( -name '*.sh' -o -name '*.bash' -o -name '*.zsh' \\) | xargs shellcheck -f json --severity=warning 2>/dev/null" ;;
     hadolint)
       echo "find . -name 'Dockerfile*' | xargs hadolint --format json 2>/dev/null" ;;
     checkov)
@@ -1239,6 +1239,9 @@ generate_sarif() {
       elif . == "Medium" then "warning"
       else "note" end;
 
+    # Filter to Medium+ severity only (exclude Low/note noise)
+    [.[] | select(.severity != "Low")] |
+
     # Build unique rules list
     (map({ rule_id, title, description, severity }) | unique_by(.rule_id)) as $rules |
 
@@ -1453,52 +1456,15 @@ cmd_scan() {
   detect_repo
   detect_timeout_cmd
 
-  printf '%b\n' "${BOLD}Security Audit — ${PROFILE} profile${RESET}"
-  printf '%b\n' "${DIM}Repository: ${REPO_ROOT}${RESET}"
-  echo ""
-
-  # Step 1: Init scan dir
-  init_scan_dir
-
-  # Step 2: Detect languages
-  detect_languages
-  if [[ -n "$DETECTED_LANGS" ]]; then
-    log_info "Languages: $DETECTED_LANGS"
+  # When --json or --sarif, send all progress output to stderr so only
+  # structured data goes to stdout (safe for piping/redirection).
+  if $OPT_JSON || $OPT_SARIF; then
+    _cmd_scan_progress >&2
   else
-    log_info "No specific languages detected"
+    _cmd_scan_progress
   fi
 
-  # Step 3: Build tool plan
-  build_tool_plan
-  [[ -z "$TOOL_PLAN" ]] && { log_warn "No tools to run."; return 0; }
-
-  # Step 4: Check availability
-  check_tool_availability
-  [[ -z "$TOOL_PLAN" ]] && { log_warn "No available tools. Run 'security-audit setup'."; return 0; }
-
-  # Convert plan to array
-  read -ra TOOLS_RUN <<< "$TOOL_PLAN"
-
-  # Step 5: Execute tools
-  run_all_tools
-
-  # Step 6: Normalize findings
-  log_info "Parsing results..."
-  normalize_findings
-
-  # Step 7: Deduplicate
-  deduplicate_findings
-
-  # Step 8: Generate report
-  generate_report
-  generate_meta
-
-  # Step 9: Finalize
-  update_latest_symlink
-  echo ""
-  print_summary
-
-  # Handle --stdout / --json
+  # Structured output to stdout (clean, no progress text mixed in)
   if $OPT_STDOUT; then
     echo ""
     echo "---"
@@ -1517,6 +1483,41 @@ cmd_scan() {
   local exit_code
   exit_code=$(compute_exit_code)
   exit "$exit_code"
+}
+
+# All progress/summary output — may be redirected to stderr when --json/--sarif
+_cmd_scan_progress() {
+  printf '%b\n' "${BOLD}Security Audit — ${PROFILE} profile${RESET}"
+  printf '%b\n' "${DIM}Repository: ${REPO_ROOT}${RESET}"
+  echo ""
+
+  init_scan_dir
+  detect_languages
+  if [[ -n "$DETECTED_LANGS" ]]; then
+    log_info "Languages: $DETECTED_LANGS"
+  else
+    log_info "No specific languages detected"
+  fi
+
+  build_tool_plan
+  [[ -z "$TOOL_PLAN" ]] && { log_warn "No tools to run."; return 0; }
+
+  check_tool_availability
+  [[ -z "$TOOL_PLAN" ]] && { log_warn "No available tools. Run 'security-audit setup'."; return 0; }
+
+  read -ra TOOLS_RUN <<< "$TOOL_PLAN"
+
+  run_all_tools
+
+  log_info "Parsing results..."
+  normalize_findings
+  deduplicate_findings
+  generate_report
+  generate_meta
+  update_latest_symlink
+
+  echo ""
+  print_summary
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
