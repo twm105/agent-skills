@@ -20,33 +20,40 @@ For scheduled scans (weekly), use the **standard** profile to include static ana
 
 | Code | CI behavior |
 |---|---|
-| 0 | Pass — no findings |
-| 1 | Fail — security findings detected |
-| 2 | Warning — tool error (findings may be incomplete) |
+| 0 | Pass — no findings at Medium or above |
+| 1 | Fail — at least one Medium+ finding |
+| 2 | Warning — tool error, findings may be incomplete (takes precedence over exit 1) |
 
 ## GitHub Actions
 
 ### Tool Installation
 
-Install tools in CI using the CLI's setup subcommand:
+Install tools in CI using the CLI's setup subcommand. The CLI is **not globally installed** on CI runners — copy `bin/security-audit` from this skill into your repo (e.g. `.github/scripts/security-audit`) and reference it by path:
 
 ```yaml
 - name: Install security tools
-  run: security-audit setup
+  run: .github/scripts/security-audit setup
 ```
 
 Or check what's available without installing:
 
 ```yaml
 - name: Check tool availability
-  run: security-audit setup --check-only
+  run: .github/scripts/security-audit setup --check-only
 ```
 
 Or install specific tools individually to minimize CI time:
 
 ```yaml
+# macOS runners:
 - name: Install gitleaks
   run: brew install gitleaks
+
+# Linux runners (ubuntu-latest):
+- name: Install gitleaks
+  run: |
+    GITLEAKS_VERSION=$(curl -s https://api.github.com/repos/gitleaks/gitleaks/releases/latest | jq -r .tag_name)
+    curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION#v}_linux_x64.tar.gz" | tar xz -C /usr/local/bin gitleaks
 
   # pip-audit requires Python ≤3.13 and an active venv — use trivy for CI instead
 - name: Install trivy
@@ -61,11 +68,11 @@ The simplest CI integration — run the CLI and use its exit code:
 ```yaml
 # Quick scan on PRs
 - name: Security audit (quick)
-  run: security-audit -p quick -q
+  run: .github/scripts/security-audit -p quick -q
 
 # Standard scan on schedule, save JSON for processing
 - name: Security audit (standard)
-  run: security-audit -p standard --json > findings.json
+  run: .github/scripts/security-audit -p standard --json > findings.json
 
 # Upload findings as artifact
 - name: Upload findings
@@ -88,7 +95,7 @@ permissions:
 
 steps:
   - name: Security audit
-    run: security-audit -p quick -q --sarif > results.sarif
+    run: .github/scripts/security-audit -p quick -q --sarif > results.sarif
     continue-on-error: true
 
   - name: Upload SARIF
@@ -100,7 +107,7 @@ steps:
 ```
 
 The SARIF output converts all unified findings (from all tools) into a single SARIF file with:
-- Severity mapping: Critical/High → `error`, Medium → `warning`, Low → `note`
+- Severity mapping: Critical/High → `error`, Medium → `warning` (Low findings are excluded from SARIF output)
 - File locations with line numbers where available
 - Remediation guidance, CVE/CWE references, and package version info in messages
 
@@ -128,25 +135,6 @@ For CI, you may prefer running tools directly rather than through the full CLI:
 - name: Semgrep
   run: semgrep scan --config=auto --json --quiet . > semgrep.json
 ```
-
-### SARIF Upload
-
-GitHub Security tab can display SARIF-formatted results. Use the CLI's `--sarif` flag to generate a single SARIF file covering all tools:
-
-```yaml
-- name: Security audit
-  run: security-audit -p quick -q --sarif > results.sarif
-  continue-on-error: true
-
-- name: Upload SARIF
-  if: always()
-  uses: github/codeql-action/upload-sarif@v3
-  with:
-    sarif_file: results.sarif
-    category: security-audit
-```
-
-Results uploaded to the Security tab are **only visible to users with write access**, even on public repos.
 
 ### Caching
 
@@ -226,7 +214,7 @@ env:
 Using the CLI's JSON output for custom threshold logic:
 
 ```bash
-security-audit -p quick --json > findings.json
+.github/scripts/security-audit -p quick --json > findings.json
 
 CRITICAL=$(jq '[.[] | select(.severity == "Critical")] | length' findings.json)
 HIGH=$(jq '[.[] | select(.severity == "High")] | length' findings.json)

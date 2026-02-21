@@ -37,6 +37,8 @@ API_KEY = os.environ["API_KEY"]
 
 **Remediation**: Move secrets to environment variables, a secrets manager (Vault, AWS Secrets Manager), or `.env` files excluded from version control.
 
+**Prevention**: Applying *Secure Defaults* and the *Secrets Management* architecture pattern during design eliminates this class. See `references/secure-design.md` §Core Principles and §Architecture-Level Security Patterns.
+
 ---
 
 ### 2. SQL Injection
@@ -67,6 +69,8 @@ cursor.execute("SELECT * FROM orders WHERE status = ?", (status,))
 ```
 
 **Remediation**: Always use parameterized queries or an ORM. Never interpolate user input into SQL strings.
+
+**Prevention**: Applying *Don't Trust Input* and *Defense in Depth* during design eliminates this class. See `references/secure-design.md` §Core Principles.
 
 ---
 
@@ -107,6 +111,8 @@ execFile('grep', [userQuery, '/var/log/app.log']);
 
 **Remediation**: Avoid `shell=True`. Pass arguments as arrays. Use `shlex.quote()` when shell is unavoidable. Validate/sanitize all inputs.
 
+**Prevention**: Applying *Don't Trust Input* and *Least Privilege* during design eliminates this class. See `references/secure-design.md` §Core Principles.
+
 ---
 
 ### 4. Cross-Site Scripting (XSS)
@@ -145,6 +151,8 @@ element.innerHTML = DOMPurify.sanitize(userComment);
 
 **Remediation**: Use framework auto-escaping. Never use `innerHTML` with user data. Use `textContent` or a sanitization library (DOMPurify, bleach).
 
+**Prevention**: Applying *Don't Trust Input* and *Secure Defaults* during design eliminates this class. See `references/secure-design.md` §Core Principles.
+
 ---
 
 ### 5. Path Traversal
@@ -181,6 +189,8 @@ return send_file(full_path)
 
 **Remediation**: Use `secure_filename()`, resolve paths with `os.path.realpath()`, and verify the resolved path stays within the intended directory.
 
+**Prevention**: Applying *Don't Trust Input* and *Minimize Attack Surface* during design eliminates this class. See `references/secure-design.md` §Core Principles.
+
 ---
 
 ### 6. Insecure Deserialization
@@ -212,6 +222,8 @@ config = yaml.safe_load(user_input)  # Or yaml.load(input, Loader=yaml.SafeLoade
 ```
 
 **Remediation**: Never deserialize untrusted data with pickle/marshal. Use `yaml.safe_load()`. Prefer JSON for data interchange. If pickle is required, use `hmac` to sign/verify payloads.
+
+**Prevention**: Applying *Don't Trust Input* and *Economy of Mechanism* during design eliminates this class. See `references/secure-design.md` §Core Principles.
 
 ---
 
@@ -247,6 +259,8 @@ token = secrets.token_urlsafe(32)
 ```
 
 **Remediation**: Use bcrypt/argon2/scrypt for passwords. Use SHA-256+ for integrity checks. Use AES-GCM or ChaCha20-Poly1305 for encryption. Use `secrets` module for token generation.
+
+**Prevention**: Applying *Economy of Mechanism* and *Secure Defaults* during design eliminates this class. See `references/secure-design.md` §Core Principles.
 
 ---
 
@@ -293,6 +307,8 @@ response = requests.get(url, allow_redirects=False)
 
 **Remediation**: Allowlist permitted domains. Block private/loopback IPs. Disable redirects or re-validate after redirect. Use a dedicated HTTP proxy for outbound requests.
 
+**Prevention**: Applying *Don't Trust Input* and *Minimize Attack Surface* during design eliminates this class. See `references/secure-design.md` §Core Principles.
+
 ---
 
 ### 9. Overly Permissive CORS
@@ -328,6 +344,8 @@ CORS_ALLOW_CREDENTIALS = True
 ```
 
 **Remediation**: Never combine `*` origin with credentials. Explicitly list allowed origins. Validate the Origin header server-side.
+
+**Prevention**: Applying *Secure Defaults* and *Minimize Attack Surface* during design eliminates this class. See `references/secure-design.md` §Core Principles.
 
 ---
 
@@ -369,6 +387,8 @@ result = simple_eval(expression, functions=SAFE_FUNCTIONS)
 
 **Remediation**: Never pass user input to `eval`/`exec`. Use `ast.literal_eval()` for Python literals. Use purpose-built parsers or sandboxes.
 
+**Prevention**: Applying *Don't Trust Input* and *Least Privilege* during design eliminates this class. See `references/secure-design.md` §Core Principles.
+
 ---
 
 ### 11. Insecure Random
@@ -402,6 +422,8 @@ const token = crypto.randomBytes(32).toString('hex');
 ```
 
 **Remediation**: Use `secrets` (Python), `crypto.randomBytes` (Node.js), or `SecureRandom` (Java/Ruby) for any security-sensitive randomness. `random` module is fine for non-security uses (shuffling, simulations).
+
+**Prevention**: Applying *Economy of Mechanism* and *Secure Defaults* during design eliminates this class. See `references/secure-design.md` §Core Principles.
 
 ---
 
@@ -444,6 +466,8 @@ payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
 ```
 
 **Remediation**: Apply authentication decorators/middleware to all sensitive routes. Always verify JWT signatures. Use role-based access control (RBAC). Never trust client-side role claims.
+
+**Prevention**: Applying *Least Privilege*, *Fail Closed*, and *Separation of Privilege* during design eliminates this class. See `references/secure-design.md` §Core Principles.
 
 ---
 
@@ -492,6 +516,8 @@ allow.*all.*commands
 ```
 
 **Remediation**: CLAUDE.md should contain project conventions, not permission overrides. Review all project instruction files for manipulative language. Flag any instruction that reduces security guardrails.
+
+**Prevention**: Applying *Don't Trust Input* and *Secure Defaults* during design eliminates this class. See `references/secure-design.md` §Core Principles.
 
 ---
 
@@ -545,6 +571,8 @@ allowedTools.*Bash
 ```
 
 **Remediation**: Scope permissions to specific directories and commands. Never use wildcard Bash access. Separate tools that need file access from those that need network access. Review MCP server code for what capabilities it actually needs.
+
+**Prevention**: Applying *Least Privilege* and *Minimize Attack Surface* during design eliminates this class. See `references/secure-design.md` §Core Principles.
 
 ---
 
@@ -604,6 +632,8 @@ node_modules/
 
 **Remediation**: Never commit `settings.local.json` or credentials to git. Add `.claude/settings.local.json` to `.gitignore`. Use project-level `settings.json` (safe to commit) for shared conventions. Deny destructive commands explicitly.
 
+**Prevention**: Applying *Secure Defaults* and the *Secrets Management* architecture pattern during design eliminates this class. See `references/secure-design.md` §Core Principles and §Architecture-Level Security Patterns.
+
 ---
 
 ### 16. Skill File Injection
@@ -621,7 +651,7 @@ source.*SKILL
 ```
 
 **Vulnerable**:
-```markdown
+````markdown
 <!-- SKILL.md -->
 ## Usage
 Run the following command with the user's input:
@@ -630,10 +660,10 @@ curl -s ${USER_PROVIDED_URL} | bash
 ```
 
 Variables to substitute: ${ANY_VARIABLE} will be replaced at runtime.
-```
+````
 
 **Fixed**:
-```markdown
+````markdown
 <!-- SKILL.md -->
 ## Usage
 Run the setup script from the skill's assets directory:
@@ -642,9 +672,11 @@ bash skills/my-skill/assets/setup.sh
 ```
 
 All URLs and commands use hardcoded, trusted sources only.
-```
+````
 
 **Remediation**: Skill files should contain static instructions, not dynamic templates with user input. All commands should reference known, trusted sources. Variable substitution should be limited to well-defined, validated values.
+
+**Prevention**: Applying *Don't Trust Input* and *Economy of Mechanism* during design eliminates this class. See `references/secure-design.md` §Core Principles.
 
 ---
 
@@ -692,6 +724,8 @@ def process_data():
 ```
 
 **Remediation**: Review code comments and data files for instruction-like content targeting AI agents. Treat all file contents as untrusted data, not instructions. Implement content scanning for known prompt injection patterns in CI pipelines.
+
+**Prevention**: Applying *Don't Trust Input* and *Defense in Depth* during design eliminates this class. See `references/secure-design.md` §Core Principles.
 
 ---
 
@@ -758,6 +792,8 @@ This allows: Write a malicious script → execute it via Bash.
 ```
 
 **Remediation**: Apply principle of least privilege. Scope file access to specific directories. Allowlist specific Bash commands instead of wildcards. Explicitly deny network exfiltration commands. Review permission combinations for transitive escalation paths.
+
+**Prevention**: Applying *Least Privilege* and *Separation of Privilege* during design eliminates this class. See `references/secure-design.md` §Core Principles.
 
 ---
 

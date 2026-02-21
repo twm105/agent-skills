@@ -17,7 +17,8 @@ Run tools only when their language indicators are present:
 | `go.mod` | govulncheck |
 | `Cargo.toml`, `Cargo.lock` | cargo audit |
 | `Gemfile`, `Gemfile.lock` | bundler-audit |
-| _(always)_ | gitleaks, semgrep |
+| _(always)_ | gitleaks |
+| _(standard/deep)_ | semgrep |
 
 ---
 
@@ -88,9 +89,12 @@ pip-audit -r requirements.txt --format=json --desc 2>/dev/null
 **Severity mapping**:
 | Condition | Mapped severity |
 |---|---|
-| CVE with known exploit | **Critical** |
 | CVE with fix available | **High** |
 | CVE without fix | **Medium** |
+
+Note: pip-audit's JSON output does not include exploit-availability data, so the
+CLI cannot distinguish "known exploit" from other CVEs. Use trivy or manual
+review for exploit intelligence.
 
 **Exit codes**: 0 = clean, 1 = vulnerabilities found.
 
@@ -325,7 +329,6 @@ shellcheck -f json --severity=warning *.sh **/*.sh 2>/dev/null
 - SC2086 — word splitting (command injection risk)
 - SC2091 — eval-like constructs
 - SC2046 — unquoted command substitution
-- SC2116 — useless use of echo in pipes
 
 **Exit codes**: 0 = clean, 1 = findings.
 
@@ -359,7 +362,7 @@ hadolint --format json Dockerfile* **/Dockerfile* 2>/dev/null
 | info, style | **Low** |
 
 **Security-relevant rules** (always flag as High):
-- DL3000 — use of `WORKDIR` with absolute path
+- DL3000 — `WORKDIR` should use an absolute path
 - DL3002 — last user should not be root
 - DL3004 — do not use sudo
 - DL3006 — always tag the `FROM` image

@@ -4,7 +4,8 @@ description: >
   Structured repository security analysis combining a CLI scanner with
   agent-driven code review. Three profiles (quick/standard/deep), auto-detects
   languages, stores reports outside the repo tree. Use when asked to audit,
-  scan, or review a repository for security issues.
+  scan, or review a repository for security issues, or when designing new
+  features that need security consideration.
 ---
 
 # security-audit
@@ -15,15 +16,18 @@ description: >
 security-audit [scan] [-p quick|standard|deep] [--stdout] [--json] [--sarif]
 security-audit setup [--check-only]
 security-audit report [--latest|--list] [--stdout]
+security-audit version
 ```
 
 | Flag | Purpose |
 |------|---------|
 | `-p, --profile` | `quick` (secrets+deps), `standard` (default, +SAST/IaC), `deep` (+full history) |
-| `-t, --tool <name>` | Run only specific tool(s), repeatable |
+| `-t, --tool <name>` | Run only specific tool(s), repeatable (accepts internal or common names, e.g. `semgrep`) |
 | `--stdout` | Print full markdown report to terminal |
 | `--json` | Print unified findings JSON to terminal |
-| `--sarif` | Print SARIF 2.1.0 to stdout (for GitHub Security tab) |
+| `--sarif` | Print SARIF 2.1.0 to stdout (for GitHub Security tab; excludes Low findings) |
+| `--no-parallel` | Run tools sequentially instead of in parallel |
+| `-v, --verbose` | Show tool commands and raw output |
 | `-q, --quiet` | Suppress progress output, exit code only |
 
 Reports are stored in `~/.local/share/security-audit/<repo>/` — never in the repo tree.
@@ -76,6 +80,53 @@ Combine CLI findings and agent review into a single summary for the user:
 - Highlight top actionable items with file:line references
 - Note tools skipped and any limitations
 
+## Design Review Workflow
+
+Use this workflow when reviewing an architecture proposal, designing a new
+feature, or when the user asks about security considerations before writing
+code.
+
+### 1. Identify Security-Relevant Scope
+
+Determine whether the design touches security-sensitive areas:
+- Authentication or authorization changes
+- New API endpoints or trust boundaries
+- Handling of PII, credentials, or sensitive data
+- New dependencies or third-party integrations
+- Infrastructure changes (ports, network, containers)
+- AI agent permissions or tool configurations
+
+If none apply, a design review is not needed — proceed normally.
+
+### 2. Apply Design Principles
+
+Read `references/secure-design.md` §Core Principles. For each of the 8
+principles, check whether the proposed design respects or violates it.
+Flag any gaps.
+
+### 3. Threat Model (if warranted)
+
+If the design introduces new trust boundaries or data flows, run the
+lightweight threat model from `references/secure-design.md` §Lightweight Threat Modeling:
+1. Identify assets, actors, and trust boundaries
+2. Enumerate threats using STRIDE-lite
+3. Map threats to principles and architecture patterns
+4. Produce a threat-mitigation table
+
+### 4. Present Design Recommendations
+
+Deliver findings to the user:
+- Which principles apply and whether the design satisfies them
+- Relevant checklists from `references/secure-design.md` §Architecture-Level Security Patterns
+- Threat-mitigation table (if threat modeling was performed)
+- Specific, actionable recommendations — not generic advice
+
+### 5. Post-Implementation Audit
+
+After the feature is implemented, run the standard audit workflow (§Workflow
+above) to verify that the design recommendations were correctly applied in
+code.
+
 ## Exit Codes
 
 | Code | Meaning |
@@ -83,6 +134,10 @@ Combine CLI findings and agent review into a single summary for the user:
 | 0 | Clean — no findings at Medium or above |
 | 1 | Findings — at least one Medium+ finding |
 | 2 | Tool error — one or more tools failed/timed out |
+
+Priority: exit code 2 (tool error) takes precedence over exit code 1 (findings).
+If a scan has both tool errors and findings, exit code 2 is returned to signal
+incomplete results.
 
 ## Severity Scale
 
@@ -108,5 +163,6 @@ Use `assets/github-action.example.yml` as the starting template. See `references
 
 - `references/tool-catalog.md` — per-tool invocation, parsing, severity mapping
 - `references/agent-checks.md` — 18 code-review patterns with examples
+- `references/secure-design.md` — secure-by-design principles, architecture patterns, threat modeling
 - `references/ci-integration.md` — CI/CD pipeline setup guide
 - `assets/github-action.example.yml` — GitHub Actions workflow example

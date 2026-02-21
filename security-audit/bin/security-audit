@@ -413,12 +413,15 @@ build_tool_plan() {
     $dup || deduped+=("$t")
   done
 
-  # Apply --tool filter if set
+  # Apply --tool filter if set (accept user-facing aliases)
   if [[ ${#TOOL_FILTER[@]} -gt 0 ]]; then
     local filtered=()
     for t in "${deduped[@]}"; do
       for f in "${TOOL_FILTER[@]}"; do
-        [[ "$t" == "$f" ]] && { filtered+=("$t"); break; }
+        # Accept "semgrep" as alias for internal name "sast"
+        local normalized="$f"
+        [[ "$normalized" == "semgrep" ]] && normalized="sast"
+        [[ "$t" == "$normalized" ]] && { filtered+=("$t"); break; }
       done
     done
     deduped=("${filtered[@]+"${filtered[@]}"}")
@@ -789,7 +792,7 @@ parse_shellcheck() {
   local raw="$SCAN_DIR/raw/shellcheck.json"
   [[ -s "$raw" ]] || { echo '[]'; return; }
   jq -r --arg tool shellcheck '
-    def security_rules: [2086, 2091, 2046, 2116];
+    def security_rules: [2086, 2091, 2046];
     def map_sev:
       if (.code | IN(security_rules[])) then "High"
       elif .level == "error" then "High"

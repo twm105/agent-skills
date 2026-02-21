@@ -79,11 +79,14 @@ jobs:
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
 
       # --- Run Scan ---
+      # The security-audit CLI is NOT installed globally. Copy bin/security-audit
+      # from the skill into your repo (e.g. .github/scripts/security-audit) and
+      # reference it by path here.
 
       - name: Security audit
         run: |
           PROFILE="${{ inputs.profile || 'quick' }}"
-          security-audit -p "$PROFILE" -q --sarif > results.sarif
+          .github/scripts/security-audit -p "$PROFILE" -q --sarif > results.sarif
         continue-on-error: true
 
       # --- Upload to Security Tab (private to repo writers) ---
